@@ -16,9 +16,9 @@ achieving **31 TH/s at 160W**
 
 ## Requirements
 
-Intel Arc B580 (12 GB) or B570 (10 GB) — tested. Other Arc GPUs with ≥10 GB VRAM may work but are untested.
-Latest Intel Arc GPU drivers.
-Windows 10 or 11, 64-bit.
+- Intel Arc B580 (12 GB) or B570 (10 GB) — tested. Other Arc GPUs with ≥10 GB VRAM may work but are untested.
+- Latest Intel Arc GPU drivers.
+- Windows 10 or 11, 64-bit.
 
 ---
 
