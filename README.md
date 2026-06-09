@@ -1,6 +1,50 @@
-# ARC-miner
-Intel arc B580-B570 prl miner
+# ARC Miner
+### The First Intel Arc GPU Pearl (PRL) Miner
 
-0% dev fee
+High-performance Pearl mining software optimized for Intel Arc B580 and B570 GPUs,
+achieving **85 TH/s at 100W** — nearly 3x more efficient than an RTX 3060 Ti.
 
-prl donate address prl1p79wzxcvatcsmnzp9xp0ep0rvfe9ans05mjtxnt4d9x0qqej0mtdqfrezc0
+---
+
+## Performance
+
+| Hardware | TH/s | Power |
+|----------|------|-------|
+| Arc B580 | 31 TH/s | 160W |
+
+---
+
+## Requirements
+
+- Intel Arc B580 or B570 GPU
+- Latest Intel Arc GPU drivers
+- .NET 10 Runtime
+
+---
+
+## Quick Start
+
+edit the A1start.bat with your info
+
+---
+
+## Features
+
+- 0% dev fee
+- Optimized XMX matrix engine kernel
+- Native Intel Level Zero backend
+
+---
+
+## Donate
+
+If ARC Miner is profitable for you, donations are appreciated:
+
+`prl1p79wzxcvatcsmnzp9xp0ep0rvfe9ans05mjtxnt4d9x0qqej0mtdqfrezc0`
+
+---
+
+## Upcoming
+
+- Intel Arc A-series support (A770, A750, A580)
+- AMD and Nvidia backends
