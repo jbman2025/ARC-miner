@@ -2,7 +2,7 @@
 ### The First Intel Arc GPU Pearl (PRL) Miner
 
 High-performance Pearl mining software optimized for Intel Arc B580 and B570 GPUs,
-achieving **85 TH/s at 100W** — nearly 3x more efficient than an RTX 3060 Ti.
+achieving **31 TH/s at 160W**
 
 ---
 
