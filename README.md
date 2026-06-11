@@ -58,5 +58,5 @@ If ARC Miner is profitable for you, donations are appreciated:
 ---
 
 ## Upcoming
-
+- linux build
 - AMD and Nvidia backends
