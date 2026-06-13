@@ -10,7 +10,7 @@ achieving **31 TH/s at 160W**
 
 | Hardware | TH/s | Power |
 |----------|------|-------|
-| Arc B580 | 31 TH/s | 160W | 12gb 
+| Arc B580 | 33 TH/s | 160W | 12gb 
 | Arc B570 | ?? TH/s | ???W | 10gb
 | Arc B50  | ?? TH/s | ???W | 16gb
 | Arc B60  | ?? TH/s | ???W | 24gb
@@ -21,7 +21,7 @@ achieving **31 TH/s at 160W**
 | Hardware | TH/s | Power |
 |----------|------|-------|
 | Arc A580 | ?? TH/s | ???W | 8gb
-| Arc A750 | 217GH/s* | ???W | 8gb
+| Arc A750 | 430GH/s* | ???W | 8gb
 | Arc A770 | ?? TH/s | ???W | 8gb
 | Arc A770 | ?? TH/s | ???W | 16gb
 ---
