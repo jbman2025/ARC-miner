@@ -1,0 +1,442 @@
+// pearl_gemm_capi_sycl.cpp — Intel Arc / SYCL backend for the pearl_capi_* C ABI.
+//
+// Mirrors pearl_gemm_capi_rocm.cpp: same ABI surface, same algorithmic steps,
+// implemented with SYCL/oneAPI instead of HIP.
+//
+// Build (oneAPI DPC++ / icpx, JIT compilation — works on any Intel GPU):
+//   icpx -fsycl -O3 -fPIC -shared \
+//     -I ../../csrc -I .. pearl_gemm_capi_sycl.cpp -o libpearl_gemm_capi.so
+//
+// For AOT (Intel Arc A-series, e.g. A770):
+//   icpx -fsycl -fsycl-targets=spir64_gen \
+//     -Xsycl-target-backend=spir64_gen "-device intel_gpu_acm_g10" \
+//     -O3 -fPIC -shared -I ../../csrc -I .. pearl_gemm_capi_sycl.cpp \
+//     -o libpearl_gemm_capi.so
+
+#include "pearl_kernels.hpp"
+#include "capi/pearl_gemm_capi.h"
+#include <cstdlib>
+#include <cstring>
+#include <cstdio>
+#include <sycl/sycl.hpp>
+#include <mutex>
+#include <chrono>
+
+#define HQUEUE(s) static_cast<sycl::queue*>(s)
+
+static inline int rc_sycl(const char* where) {
+    fprintf(stderr, "[pearl_sycl] error in %s\n", where);
+    return -100;
+}
+
+// ── Workspace struct ─────────────────────────────────────────────────────────
+
+struct SyclWorkspace {
+    int m, n, k, r, ntiles;
+    int sm_cap = 0;          // rows gemmScratch is sized for (search-M window)
+    // Device-side buffers
+    int*     host_signal;    // device mem, 8 bytes (int + padding)
+    uint8_t* dHeader;        // device mem, 640 bytes
+    int32_t* gemmScratch;    // sm_cap*k int32 for E_A (only the search rows)
+    uint8_t* bseedScratch;   // 32 bytes for bseed expand seed copy
+    int8_t*  Bt = nullptr;   // BpEB transposed to [k,n] row-major (for fast XMX B load)
+    bool     bt_valid = false;
+    PearlCapiWorkspaceParams params;
+    bool installed = false;
+    sycl::queue* q_alloc = nullptr;  // queue used for allocation (context anchor)
+};
+
+// ── C ABI ────────────────────────────────────────────────────────────────────
+
+#ifdef _WIN32
+#  define PEARL_EXPORT __declspec(dllexport)
+#else
+#  define PEARL_EXPORT
+#endif
+
+// Search-M window: how many A rows the per-iter E_A/ApEA/tgemm actually sweep.
+// Must be computed identically in workspace_alloc (to size gemmScratch) and in
+// iter (to drive the kernels). Tile-aligned to 16; clamped to [16, m].
+static int compute_search_m(int m) {
+    // Empty or non-numeric values fall back to the default rather than
+    // clamping to 16: an empty AKOYA_SEARCH_M= (e.g. left behind by a shell
+    // that "unsets" by assigning blank) would otherwise silently shrink the
+    // search window 256× while the C# side still reports full-window hashrate.
+    const char* v = getenv("AKOYA_SEARCH_M");
+    int sm = (v && atoi(v) > 0) ? atoi(v) : 4096;
+    if (sm > m) sm = m;
+    sm = (sm / 16) * 16;
+    if (sm < 16) sm = 16;
+    return sm;
+}
+
+extern "C" {
+
+PEARL_EXPORT int pearl_capi_abi_version(void) { return 2; }
+PEARL_EXPORT const char* pearl_capi_build_profile(void) { return "arc"; }
+
+// GPU family this kernel was AOT-compiled for, so the host can reject a
+// wrong-card launch with a clear message instead of crashing on the first
+// kernel (an AOT gen binary only runs on its target generation). "acm" =
+// Alchemist/Xe-HPG (sg8), "bmg" = Battlemage/Xe2 (sg16), "" = JIT (any Arc).
+// Keyed off the single-arch variant pin that build.ps1 sets for AOT builds.
+PEARL_EXPORT const char* pearl_capi_target_family(void) {
+#if defined(PEARL_XMX_ONLY_SG8)
+    return "acm";
+#elif defined(PEARL_XMX_ONLY_SG16)
+    return "bmg";
+#else
+    return "";
+#endif
+}
+PEARL_EXPORT int pearl_capi_supports_sm(int, int) { return 1; }
+PEARL_EXPORT int pearl_capi_get_host_signal_sync_size(void) { return 8; }
+PEARL_EXPORT int pearl_capi_get_host_signal_header_size(void) { return 640; }
+PEARL_EXPORT int64_t pearl_capi_get_required_scratchpad_bytes(int64_t matrix_bytes, int) {
+    int64_t nchunks = (matrix_bytes + 1023) / 1024; if (nchunks < 1) nchunks = 1;
+    return 2 * nchunks * 32 + 4096;
+}
+
+PEARL_EXPORT int pearl_capi_lcg_int7_fill(void* dst, int64_t n,
+                              uint64_t seed_lo, uint64_t seed_hi, void* stream) {
+    try {
+        pk::launch_lcg_int7_fill(dst, n, seed_lo, seed_hi, HQUEUE(stream));
+        return 0;
+    } catch (...) { return rc_sycl("lcg_int7_fill"); }
+}
+
+PEARL_EXPORT int pearl_capi_lcg_int7_fill_indirect(void*, int64_t, const void*, uint64_t, uint64_t, void*) {
+    return -1;
+}
+
+PEARL_EXPORT int pearl_capi_tensor_hash(const uint8_t* data, uint32_t data_size, uint8_t* out,
+                            const uint8_t* key, uint32_t, uint32_t, uint32_t, uint32_t,
+                            uint8_t* roots, int, void* stream) {
+    try {
+        pk::parallel_tensor_hash(data, (long)data_size, (const u32*)key,
+                                 (u32*)roots, out, HQUEUE(stream));
+        return 0;
+    } catch (...) { return rc_sycl("tensor_hash"); }
+}
+
+PEARL_EXPORT int pearl_capi_tensor_hash_leaf_cvs(const uint8_t* d, uint32_t s, uint8_t* o,
+                                     const uint8_t* k, uint32_t, uint32_t, uint32_t, uint32_t,
+                                     uint8_t* r, uint8_t* leaf_cvs, int, void* st) {
+    try {
+        pk::parallel_tensor_hash(d, (long)s, (const u32*)k, (u32*)r, o,
+                                 HQUEUE(st), leaf_cvs);
+        return 0;
+    } catch (...) { return rc_sycl("tensor_hash_leaf_cvs"); }
+}
+
+PEARL_EXPORT int pearl_capi_commitment_hash_from_merkle_roots(const uint8_t* A, const uint8_t* B,
+                                                  const uint8_t* key,
+                                                  uint8_t* CA, uint8_t* CB, int, void* stream) {
+    try {
+        pk::launch_commitment_hash(A, B, key, CA, CB, HQUEUE(stream));
+        return 0;
+    } catch (...) { return rc_sycl("commitment_hash"); }
+}
+
+PEARL_EXPORT int pearl_capi_noise_gen(int R, int m, int n, int k,
+                          void* EAL, void* EAL_fp16, void* EAR_R, void* EAR_K,
+                          void* EBL_R, void* EBL_K, void* EBR, void* EBR_fp16,
+                          const uint8_t* key_A, const uint8_t* key_B, void* stream) {
+    try {
+        pk::launch_noise_gen(R, m, n, k, EAL, EAL_fp16, EAR_R, EAR_K,
+                             EBL_R, EBL_K, EBR, EBR_fp16, key_A, key_B, HQUEUE(stream));
+        return 0;
+    } catch (...) { return rc_sycl("noise_gen"); }
+}
+
+PEARL_EXPORT int pearl_capi_bseed_expand_raw_device(const uint8_t* bseed, void* dst, int64_t n,
+                                        void* stream) {
+    try {
+        pk::launch_bseed_expand(bseed, dst, n, HQUEUE(stream));
+        return 0;
+    } catch (...) { return rc_sycl("bseed_expand"); }
+}
+
+PEARL_EXPORT int pearl_capi_bseed_expand_range_raw_device(const uint8_t*, uint64_t, void*, int64_t, void*) {
+    return -1;
+}
+
+// ── Workspace ────────────────────────────────────────────────────────────────
+
+PEARL_EXPORT int pearl_capi_workspace_alloc(int32_t m, int32_t n, int32_t k, int32_t r,
+                                int, int, void** out, void* stream) {
+    try {
+        auto* q = HQUEUE(stream);
+        auto* w = new SyclWorkspace();
+        w->m = m; w->n = n; w->k = k; w->r = r;
+        w->ntiles = (m / 16) * (n / 16);
+        w->q_alloc = q;
+        // gemmScratch only ever holds E_A for the SEARCH rows ([sm,k]), never the
+        // full [m,k]. At canonical m=131072,k=4096 the old full-size alloc was a
+        // 2 GiB int32 buffer of which <2% was used; size it to the search window.
+        w->sm_cap = compute_search_m(m);
+        w->host_signal = sycl::malloc_device<int>(2, *q);      // 8 bytes
+        w->dHeader     = sycl::malloc_device<uint8_t>(640, *q);
+        w->gemmScratch = sycl::malloc_device<int32_t>((size_t)w->sm_cap * k, *q);
+        w->bseedScratch = sycl::malloc_device<uint8_t>(32, *q);
+        w->Bt = sycl::malloc_device<int8_t>((size_t)n * k, *q);  // [k,n] transposed B
+        *out = w;
+        return 0;
+    } catch (...) { return rc_sycl("workspace_alloc"); }
+}
+
+PEARL_EXPORT int pearl_capi_workspace_free(void* ws, void*) {
+    auto* w = static_cast<SyclWorkspace*>(ws);
+    if (!w) return -1;
+    try {
+        auto& q = *w->q_alloc;
+        q.wait();
+        sycl::free(w->host_signal,  q);
+        sycl::free(w->dHeader,      q);
+        sycl::free(w->gemmScratch,  q);
+        sycl::free(w->bseedScratch, q);
+        if (w->Bt) sycl::free(w->Bt, q);
+    } catch (...) {}
+    delete w;
+    return 0;
+}
+
+PEARL_EXPORT int pearl_capi_workspace_install_params(void* ws, const PearlCapiWorkspaceParams* p) {
+    auto* w = static_cast<SyclWorkspace*>(ws);
+    if (!w || !p) return -1;
+    w->params   = *p;
+    w->installed = true;
+    w->bt_valid = false;   // BpEB changed → transposed copy is stale
+    return 0;
+}
+
+// ── iter ─────────────────────────────────────────────────────────────────────
+
+static const bool g_prof = [](){ const char* e = getenv("AKOYA_PROFILE_ITER"); return e && e[0]=='1'; }();
+
+PEARL_EXPORT int pearl_capi_iter(void* ws, uint64_t seed_lo,
+                    void* host_signal_header_pinned, void* stream) {
+    auto* w = static_cast<SyclWorkspace*>(ws);
+    if (!w || !w->installed) return -3;
+    auto* q = HQUEUE(stream);
+    const PearlCapiWorkspaceParams& p = w->params;
+    int m = w->m, n = w->n, k = w->k, r = w->r;
+
+    // Decouple COMMIT shape (m,n — full canonical, e.g. 131072) from SEARCH window
+    // (sm,sn — the sub-grid of tiles we actually compute & sweep). hash_a/hash_b are
+    // committed over the full A/B; we only noise/E_A/ApEA/tgemm a small window and
+    // open the winning tile (rows < sm) against the full merkle. Env-tunable.
+    // Sweep a large window per commitment so the (expensive, full-size) A merkle is
+    // amortized over many tiles. Buffers are already allocated full-size, so a big
+    // window costs no extra VRAM. Capped so the tgemm stays under the ~2s Windows
+    // TDR limit at k=4096 (≈16M tiles ≈ 1.7e13 MACs). sm×sn ≈ 4.3e9 elements.
+    auto envi = [](const char* k, int def){ const char* v = getenv(k); return (v && atoi(v) > 0) ? atoi(v) : def; };
+    int sm = compute_search_m(m);  // identical to the value gemmScratch was sized for
+    // Safety: never sweep more rows than gemmScratch can hold (env could change).
+    if (w->sm_cap > 0 && sm > w->sm_cap) sm = w->sm_cap;
+    int sn = envi("AKOYA_SEARCH_N", 131072);
+    if (sn > n) sn = n;
+    sn = (sn / 64) * 64;            // NB=4 → numTilesN must be %4 (i.e. sn %64)
+    if (sn < 64) sn = 64;
+
+    static bool dbg_once = false;
+    if (!dbg_once) {
+        dbg_once = true;
+        fprintf(stderr, "[pearl_sycl dbg] m=%d n=%d k=%d r=%d sm=%d sn=%d sm_cap=%d\n",
+                m, n, k, r, sm, sn, w->sm_cap);
+    }
+
+    // Optional per-step profiling (AKOYA_PROFILE_ITER=1): syncs after each step
+    // (so it serializes — diagnostic only) and prints accumulated ms every 50 iters.
+    static double acc[10] = {}; static int pn = 0;
+    using clk = std::chrono::high_resolution_clock;
+    auto t0 = clk::now();
+    auto lap = [&](int i){ if (g_prof){ q->wait();
+        acc[i] += std::chrono::duration<double,std::milli>(clk::now()-t0).count(); t0 = clk::now(); } };
+
+    // 1. A = lcg
+    pearl_capi_lcg_int7_fill(p.A, (int64_t)m * k, seed_lo, p.sigma_seed, stream);
+    lap(0);
+
+    // 2. AHash = tensor_hash(A)
+    pk::parallel_tensor_hash((const uint8_t*)p.A, (long)m * k, (const u32*)p.Key,
+                             (u32*)p.Roots, (uint8_t*)p.AHash, q);
+    lap(1);
+
+    // 3. commitment
+    pk::launch_commitment_hash((const uint8_t*)p.AHash, (const uint8_t*)p.BHash,
+                               (const uint8_t*)p.Key,
+                               (uint8_t*)p.CommitA, (uint8_t*)p.CommitB, q);
+    lap(2);
+
+    // 4. noise_gen A-side — only the sm search rows of EAL are needed.
+    pk::launch_noise_gen(r, sm, n, k,
+                         p.EAL, p.EAL_fp16, p.EAR_R_major, p.EAR_K_major,
+                         nullptr, nullptr, nullptr, nullptr,
+                         (const uint8_t*)p.CommitA, nullptr, q);
+    lap(3);
+
+    // 5. E_A = EAL[sm,r] × EAR_K[r,k] → gemmScratch (search rows only)
+    pk::launch_gemm_i8((const int8_t*)p.EAL, (const int8_t*)p.EAR_K_major,
+                       w->gemmScratch, sm, k, r, q);
+    lap(4);
+
+    // 6. ApEA = A + int8(E_A) for the search rows (A[0..sm) is a prefix of full A)
+    pk::launch_add_i8((const int8_t*)p.A, w->gemmScratch, (int8_t*)p.ApEA,
+                      sm * k, q);
+    lap(5);
+
+    // 6b. Transpose BpEB[n,k] → Bt[k,n] once per σ (BpEB is constant across the
+    //     thousands of iters in a σ period). The XMX tgemm then loads B with a
+    //     fast row-major layout instead of a strided col-major load.
+    if (!w->bt_valid) {
+        pk::launch_transpose_i8((const int8_t*)p.BpEB, w->Bt, n, k, q);
+        w->bt_valid = true;
+    }
+    lap(6);
+
+    // 7. Zero host_signal + dHeader, then run tgemm_pow
+    if (p.host_signal_sync) q->memset(p.host_signal_sync, 0, 8);
+    q->memset(w->dHeader, 0, 640);
+    q->memset(w->host_signal, 0, 8);
+
+    // Search the sm×sn tile window; Bt's row stride stays the full committed n.
+    pk::launch_tgemm_pow((const int8_t*)p.ApEA, (const int8_t*)w->Bt,
+                         sm, sn, k, r,
+                         (const u32*)p.pow_key, (const u32*)p.pow_target,
+                         w->host_signal, w->dHeader, q, n);
+    lap(7);
+    if (g_prof && ++pn % 50 == 0) {
+        fprintf(stderr, "[prof ms/iter x50] lcg=%.2f thash=%.2f commit=%.2f noise=%.2f egemm=%.2f add=%.2f tpose=%.2f tgemm=%.2f\n",
+                acc[0]/50,acc[1]/50,acc[2]/50,acc[3]/50,acc[4]/50,acc[5]/50,acc[6]/50,acc[7]/50);
+        for (int i=0;i<10;++i) acc[i]=0;
+    }
+
+    // 8. Copy device header to pinned host memory
+    if (host_signal_header_pinned) {
+        q->memcpy(host_signal_header_pinned, w->dHeader, 640);
+    }
+
+    return 0;
+}
+
+PEARL_EXPORT int pearl_capi_iter_batch(void* ws, uint64_t seed_lo_start,
+                           void* const* hdrs, int32_t count, void* stream) {
+    for (int i = 0; i < count; ++i) {
+        int rc = pearl_capi_iter(ws, seed_lo_start + (uint64_t)i,
+                                 hdrs ? hdrs[i] : nullptr, stream);
+        if (rc) return rc;
+    }
+    return 0;
+}
+
+PEARL_EXPORT int pearl_capi_iter_batch_graph_prepare(void*, void* const*, int32_t, void*) { return -1; }
+PEARL_EXPORT int pearl_capi_iter_batch_graph_launch(void*, uint64_t, void*) { return -1; }
+
+// ── noise_B: BpEB[n,k] = (Bᵀ + int8(EBL·EBRᵀ))ᵀ ────────────────────────────
+
+PEARL_EXPORT int pearl_capi_noise_B(const PearlCapiNoiseBParams* p, void* stream) {
+    if (!p) return -1;
+    auto* q = HQUEUE(stream);
+    int n = p->n, k = p->k, r = p->r;
+
+    // N-tiled. The untiled path allocated a full-width int32 EB[k,n] (2 GiB at
+    // canonical k=4096,n=131072) plus two k*n int8 temporaries (~512 MiB each)
+    // — ~3 GiB of transient σ-install VRAM that pushed a 12 GB card into shared
+    // memory. We compute BpEB one N-block at a time. Each slice below is a
+    // contiguous sub-array (B/EBR/BpEB are row-major with the n index outermost,
+    // so rows [n0,n0+cb) are contiguous), and the per-element int8(EBL·EBRᵀ) add
+    // is independent across columns, so the output is bit-identical to untiled.
+    int cn = []{ const char* v = getenv("AKOYA_NOISEB_NTILE"); return (v && atoi(v) > 0) ? atoi(v) : 16384; }();
+    if (cn > n) cn = n;
+    cn = (cn / 128) * 128;          // keep the XMX gemm fast path (N % 128 == 0)
+    if (cn < 128) cn = 128;
+    if (cn > n) cn = n;
+
+    // Block scratch — sized for the widest block, reused across blocks.
+    auto* EBRt = sycl::malloc_device<int8_t>((size_t)r * cn, *q);
+    auto* Bkn  = sycl::malloc_device<int8_t>((size_t)k * cn, *q);
+    auto* Bnoi = sycl::malloc_device<int8_t>((size_t)k * cn, *q);
+    auto* EB   = sycl::malloc_device<int32_t>((size_t)k * cn, *q);
+    auto cleanup = [&]{
+        sycl::free(EBRt, *q); sycl::free(Bkn, *q);
+        sycl::free(Bnoi, *q); sycl::free(EB,  *q);
+    };
+
+    try {
+        const int8_t* B    = (const int8_t*)p->B;             // [n,k]
+        const int8_t* EBR  = (const int8_t*)p->EBR;           // [n,r]
+        const int8_t* EBLR = (const int8_t*)p->EBL_R_major;   // [k,r]
+        int8_t*       BpEB = (int8_t*)p->BpEB;                // [n,k]
+
+        for (int n0 = 0; n0 < n; n0 += cn) {
+            int cb = (n0 + cn <= n) ? cn : (n - n0);
+
+            // EBRt[r,cb] = (EBR[n0:n0+cb, r])ᵀ
+            pk::launch_transpose_i8(EBR + (size_t)n0 * r, EBRt, cb, r, q);
+            // EB[k,cb] = EBL_R[k,r] × EBRt[r,cb]
+            pk::launch_gemm_i8(EBLR, EBRt, EB, k, cb, r, q);
+            // Bkn[k,cb] = (B[n0:n0+cb, k])ᵀ
+            pk::launch_transpose_i8(B + (size_t)n0 * k, Bkn, cb, k, q);
+            // Bnoi[k,cb] = Bkn + int8(EB)
+            pk::launch_add_i8(Bkn, EB, Bnoi, k * cb, q);
+            // BpEB[n0:n0+cb, k] = (Bnoi[k,cb])ᵀ
+            pk::launch_transpose_i8(Bnoi, BpEB + (size_t)n0 * k, k, cb, q);
+        }
+        q->wait();
+    } catch (...) {
+        cleanup();
+        return rc_sycl("noise_B");
+    }
+    cleanup();
+    return 0;
+}
+
+PEARL_EXPORT int pearl_capi_install_B(const PearlCapiInstallBParams* p, void* stream) {
+    if (!p) return -1;
+    auto* q = HQUEUE(stream);
+
+    // 1. Optionally expand BSeed → B, then hash B → BHash
+    if (p->expand_bseed && p->bseed) {
+        int rc = pearl_capi_bseed_expand_raw_device(
+            (const uint8_t*)p->bseed, p->B, (int64_t)p->n * p->k, stream);
+        if (rc) return rc;
+        q->wait();
+    }
+    // Also export leaf CVs for the CPU Merkle tree
+    pk::parallel_tensor_hash((const uint8_t*)p->B, (long)p->n * p->k,
+                             (const u32*)p->Key, (u32*)p->Roots,
+                             (uint8_t*)p->BHash, q, (uint8_t*)p->LeafCvs);
+    q->wait();
+
+    // 2. commitment_hash
+    int rc = pearl_capi_commitment_hash_from_merkle_roots(
+        (const uint8_t*)p->AHash, (const uint8_t*)p->BHash,
+        (const uint8_t*)p->Key, (uint8_t*)p->CommitA, (uint8_t*)p->CommitB,
+        p->device_id, stream);
+    if (rc) return rc;
+    q->wait();
+
+    // 3. noise_gen (EAR keyed by CommitA, EBR/EBL keyed by CommitB)
+    rc = pearl_capi_noise_gen(p->r, p->m, p->n, p->k,
+                              nullptr, nullptr, nullptr, p->EAR_K_major,
+                              p->EBL_R_major, p->EBL_K_major,
+                              p->EBR, p->EBR_fp16,
+                              (const uint8_t*)p->CommitA, (const uint8_t*)p->CommitB,
+                              stream);
+    if (rc) return rc;
+    q->wait();
+
+    // 4. noise_B → BpEB
+    PearlCapiNoiseBParams nb{};
+    nb.n = p->n; nb.k = p->k; nb.r = p->r;
+    nb.B = p->B; nb.EAR_K_major = p->EAR_K_major;
+    nb.EBL_R_major = p->EBL_R_major; nb.EBR = p->EBR;
+    nb.EARxBpEB = p->EARxBpEB; nb.BpEB = p->BpEB;
+    nb.workspace = p->workspace;
+    return pearl_capi_noise_B(&nb, stream);
+}
+
+PEARL_EXPORT int pearl_capi_noisy_gemm(const PearlCapiNoisyGemmParams*, void*) { return -1; }
+
+} // extern "C"
