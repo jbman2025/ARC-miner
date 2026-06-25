@@ -1,6 +1,7 @@
 #include "noise_generation_host.h"
 #include "pearl_api_params.h"
 
+template void run_noise_generation<256, 64>(Noise_gen_params&, cudaStream_t);  // GB10 / stratum mainnet (noise_rank=256)
 template void run_noise_generation<128, 32>(Noise_gen_params&, cudaStream_t);
 template void run_noise_generation<128, 64>(Noise_gen_params&, cudaStream_t);
 template void run_noise_generation<128, 128>(Noise_gen_params&, cudaStream_t);
