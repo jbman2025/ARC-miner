@@ -40,6 +40,10 @@ inline bool is_xe_hpg(sycl::queue* q) {
     }();
     if (forced == 8)  return true;
     if (forced == 16) return false;
+    // Query the queue's actual device every call — per-device-correct. (A prior
+    // thread_local cache could return the WRONG arch on a multi-GPU rig where a
+    // host thread services more than one device; the arch query is cheap vs the
+    // ~60ms GPU iter, so caching isn't worth that hazard.)
     try {
         namespace sex = sycl::ext::oneapi::experimental;
         auto arch = q->get_device().get_info<sex::info::device::architecture>();
@@ -64,14 +68,16 @@ struct KTransposeI8{};
 struct KBseed{};
 struct KBlakeLeaves{};
 struct KBlakeReduce{};
+struct KBlakeLeavesFused{};
+struct KBlakeReduceFused{};
 struct KGemmI8{};
 template<int SG> struct KGemmI8X{};
-template<int MB, int NB, int SG> struct KTgemmPow{};
+template<int MB, int NB, int SG, int R_const = 0> struct KTgemmPow{};
 struct KPowCheck{};
 
 // ── LCG int7 fill ─────────────────────────────────────────────────────────
 inline void launch_lcg_int7_fill(void* dst, int64_t n,
-                                  uint64_t seed_lo, uint64_t seed_hi,
+                                  uint64_t base,
                                   sycl::queue* q) {
     auto* out = static_cast<int8_t*>(dst);
     int64_t n8 = n / 8;
@@ -84,21 +90,28 @@ inline void launch_lcg_int7_fill(void* dst, int64_t n,
             z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
             return z ^ (z >> 31);
         };
-        uint64_t base = splitmix(seed_lo ^ splitmix(seed_hi));
         int64_t i = (int64_t)id[0];
         if (i < n8) {
             uint64_t z = splitmix(base + (uint64_t)i);
+            // Branchless %127 (v<=255 ⇒ two conditional subtractions are exact) +
+            // pack the 8 results into one 64-bit coalesced store (Gemini fixes #2,#3).
+            uint64_t packed = 0;
             for (int b = 0; b < 8; ++b) {
                 uint32_t v = (uint32_t)((z >> (b * 8)) & 0xFF);
-                out[i * 8 + b] = (int8_t)((int)(v % 127) - 63);
+                v = (v >= 127) ? v - 127 : v;
+                v = (v >= 127) ? v - 127 : v;
+                packed |= (uint64_t)(uint8_t)((int)v - 63) << (b * 8);
             }
+            *reinterpret_cast<uint64_t*>(out + i * 8) = packed;   // out+i*8 is 8-aligned
         }
         if (i == 0 && (n % 8)) {
             uint64_t z = splitmix(base + (uint64_t)n8);
             int64_t t = n - n8 * 8;
             for (int b = 0; b < (int)t; ++b) {
                 uint32_t v = (uint32_t)((z >> (b * 8)) & 0xFF);
-                out[n8 * 8 + b] = (int8_t)((int)(v % 127) - 63);
+                v = (v >= 127) ? v - 127 : v;
+                v = (v >= 127) ? v - 127 : v;
+                out[n8 * 8 + b] = (int8_t)((int)v - 63);
             }
         }
     });
@@ -126,7 +139,7 @@ inline void parallel_tensor_hash(const uint8_t* data, long len, const u32* key,
                 b3::init_cv(cv, key);
                 int nb = (int)((rem + 63) / 64); if (nb < 1) nb = 1;
                 for (int b = 0; b < nb; ++b) {
-                    u32 bl[16]; uint8_t bf[64];
+                    u32 bl[16]; alignas(4) uint8_t bf[64];   // aligned load_le32 (Gemini fix #1)
                     for (int j = 0; j < 64; ++j)
                         bf[j] = (off + b*64 + j < len) ? data[off + b*64 + j] : 0;
                     for (int j = 0; j < 16; ++j) bl[j] = b3::load_le32(bf + j*4);
@@ -158,6 +171,105 @@ inline void parallel_tensor_hash(const uint8_t* data, long len, const u32* key,
         u32* cur_ob = ob_buf;
         bool is_root = (npairs == 1);
         q->parallel_for<KBlakeReduce>(
+            sycl::range<1>((size_t)((npairs + tpb - 1) / tpb) * tpb),
+            [=](sycl::id<1> id) {
+                long i = (long)id[0]; if (i >= cur_pairs) return;
+                u32 o[8];
+                b3::parent_cv(cur_in + (2*i)*8, cur_in + (2*i+1)*8, key, is_root && cur_pairs == 1, o);
+                for (int j = 0; j < 8; ++j) cur_ob[i*8+j] = o[j];
+            });
+        if (npairs == 1) { q->memcpy(out, ob_buf, 32); break; }
+        u32* t = in_buf; in_buf = ob_buf; ob_buf = t;
+        npairs /= 2;
+    }
+}
+
+inline void parallel_tensor_hash_fused(uint8_t* data, long len, const u32* key,
+                                        u32* scratch, uint8_t* out,
+                                        sycl::queue* q, uint64_t base, long write_limit) {
+    long nchunks = (len + 1023) / 1024; if (nchunks < 1) nchunks = 1;
+    u32* bufA = scratch;
+    u32* bufB = scratch + nchunks * 8;
+    const int tpb = 256;
+
+    // Leaf hashes (Fused LCG + Blake3)
+    q->parallel_for<KBlakeLeavesFused>(
+        sycl::range<1>((size_t)((nchunks + tpb - 1) / tpb) * tpb),
+        [=](sycl::id<1> id) {
+            long i = (long)id[0]; if (i >= nchunks) return;
+            long off = i * b3::CHUNK_SIZE;
+            u32 cv[8];
+            
+            auto splitmix = [](uint64_t z) -> uint64_t {
+                z += 0x9E3779B97F4A7C15ULL;
+                z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+                z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+                return z ^ (z >> 31);
+            };
+            
+            b3::init_cv(cv, key);
+            bool write_to_dram = (off < write_limit);
+            
+            #pragma unroll 1
+            for (int b = 0; b < b3::BLOCKS_PER_CHUNK; ++b) {
+                u32 bl[16];
+                
+                // Generate 64-byte block using 8 LCG (splitmix) calls
+                #pragma unroll 1
+                for (int w = 0; w < 8; ++w) {
+                    uint64_t z = splitmix(base + (uint64_t)(i * 128 + b * 8 + w));
+                    
+                    uint32_t v0 = (uint32_t)(z & 0xFF); v0 = (v0 >= 127) ? v0 - 127 : v0; v0 = (v0 >= 127) ? v0 - 127 : v0;
+                    uint32_t v1 = (uint32_t)((z >> 8) & 0xFF); v1 = (v1 >= 127) ? v1 - 127 : v1; v1 = (v1 >= 127) ? v1 - 127 : v1;
+                    uint32_t v2 = (uint32_t)((z >> 16) & 0xFF); v2 = (v2 >= 127) ? v2 - 127 : v2; v2 = (v2 >= 127) ? v2 - 127 : v2;
+                    uint32_t v3 = (uint32_t)((z >> 24) & 0xFF); v3 = (v3 >= 127) ? v3 - 127 : v3; v3 = (v3 >= 127) ? v3 - 127 : v3;
+                    uint32_t val_low = (uint32_t)(uint8_t)((int)v0 - 63) |
+                                      ((uint32_t)(uint8_t)((int)v1 - 63) << 8) |
+                                      ((uint32_t)(uint8_t)((int)v2 - 63) << 16) |
+                                      ((uint32_t)(uint8_t)((int)v3 - 63) << 24);
+
+                    uint32_t v4 = (uint32_t)((z >> 32) & 0xFF); v4 = (v4 >= 127) ? v4 - 127 : v4; v4 = (v4 >= 127) ? v4 - 127 : v4;
+                    uint32_t v5 = (uint32_t)((z >> 40) & 0xFF); v5 = (v5 >= 127) ? v5 - 127 : v5; v5 = (v5 >= 127) ? v5 - 127 : v5;
+                    uint32_t v6 = (uint32_t)((z >> 48) & 0xFF); v6 = (v6 >= 127) ? v6 - 127 : v6; v6 = (v6 >= 127) ? v6 - 127 : v6;
+                    uint32_t v7 = (uint32_t)(z >> 56); v7 = (v7 >= 127) ? v7 - 127 : v7; v7 = (v7 >= 127) ? v7 - 127 : v7;
+                    uint32_t val_high = (uint32_t)(uint8_t)((int)v4 - 63) |
+                                       ((uint32_t)(uint8_t)((int)v5 - 63) << 8) |
+                                       ((uint32_t)(uint8_t)((int)v6 - 63) << 16) |
+                                       ((uint32_t)(uint8_t)((int)v7 - 63) << 24);
+                    
+                    bl[w * 2]     = val_low;
+                    bl[w * 2 + 1] = val_high;
+                    
+                    if (write_to_dram) {
+                        auto* out_ptr = reinterpret_cast<uint32_t*>(data + off + b * 64);
+                        out_ptr[w * 2]     = val_low;
+                        out_ptr[w * 2 + 1] = val_high;
+                    }
+                }
+                
+                u32 f = (key ? b3::KEYED_HASH : (u32)0);
+                if (b == 0) f |= b3::CHUNK_START;
+                if (b == b3::BLOCKS_PER_CHUNK-1) { f |= b3::CHUNK_END; if (nchunks == 1) f |= b3::ROOT; }
+                b3::compress(cv, bl, (u64)i, 64, f);
+            }
+            
+            for (int j = 0; j < 8; ++j) bufA[i * 8 + j] = cv[j];
+        });
+
+    if (nchunks == 1) {
+        q->memcpy(out, bufA, 32);
+        return;
+    }
+
+    u32* in_buf = bufA;
+    u32* ob_buf = bufB;
+    long npairs = nchunks / 2;
+    while (true) {
+        long cur_pairs = npairs;
+        u32* cur_in = in_buf;
+        u32* cur_ob = ob_buf;
+        bool is_root = (npairs == 1);
+        q->parallel_for<KBlakeReduceFused>(
             sycl::range<1>((size_t)((npairs + tpb - 1) / tpb) * tpb),
             [=](sycl::id<1> id) {
                 long i = (long)id[0]; if (i >= cur_pairs) return;
@@ -209,7 +321,7 @@ inline void launch_noise_gen(int R, int m, int n, int k,
                 // seed = "A_tensor" at msg[32..39]
                 msg[32]='A'; msg[33]='_'; msg[34]='t'; msg[35]='e';
                 msg[36]='n'; msg[37]='s'; msg[38]='o'; msg[39]='r';
-                uint8_t h[32]; b3::hash_small(msg, 64, (const u32*)key_A, h);
+                alignas(4) uint8_t h[32]; b3::hash_small(msg, 64, (const u32*)key_A, h);
                 for (int j = 0; j < 32; ++j) {
                     int idx = i*32+j;
                     if (idx < nb) {
@@ -241,10 +353,10 @@ inline void launch_noise_gen(int R, int m, int n, int k,
                 // seed tag in [32..39]; rest zero
                 msg[32]=s0; msg[33]=s1; msg[34]=s2; msg[35]=s3;
                 msg[36]=s4; msg[37]=s5; msg[38]=s6; msg[39]=s7;
-                uint8_t h[32]; b3::hash_small(msg, 64, (const u32*)perm_key, h);
+                u32 h[8]; b3::hash_small_u32(msg, 64, (const u32*)perm_key, h);
                 for (int kk = 0; kk < 8; ++kk) {
                     int L = i*8 + kk; if (L >= req) break;
-                    u32 u = b3::load_le32(h + kk*4);
+                    u32 u = h[kk];
                     int fi = (int)(u & (uint32_t)(R-1));
                     uint64_t prod = (uint64_t)(uint32_t)(R-1) * (uint64_t)u;
                     int si = fi ^ (1 + (int)(uint32_t)(prod >> 32));
@@ -271,7 +383,7 @@ inline void launch_noise_gen(int R, int m, int n, int k,
                 msg[2] = (uint8_t)((1+i)>>16); msg[3] = (uint8_t)((1+i)>>24);
                 msg[32]='B'; msg[33]='_'; msg[34]='t'; msg[35]='e';
                 msg[36]='n'; msg[37]='s'; msg[38]='o'; msg[39]='r';
-                uint8_t h[32]; b3::hash_small(msg, 64, (const u32*)key_B, h);
+                alignas(4) uint8_t h[32]; b3::hash_small(msg, 64, (const u32*)key_B, h);
                 for (int j = 0; j < 32; ++j) {
                     int idx = i*32+j;
                     if (idx < nb) {
@@ -315,11 +427,27 @@ inline void launch_bseed_expand(const uint8_t* bseed, void* dst, int64_t n,
             long base = j * 64;
             for (int w = 0; w < 16; ++w) {
                 u32 v = o[w];
-                for (int b = 0; b < 4; ++b) {
-                    long idx = base + w*4 + b;
-                    if (idx < n) {
+                long woff = base + w * 4;
+                if (woff + 4 <= n) {
+                    // Full word: branchless %127 + one 32-bit coalesced store
+                    // (Gemini fixes #2,#3). woff is 4-aligned (base%64, w*4%4).
+                    uint32_t packed = 0;
+                    for (int b = 0; b < 4; ++b) {
                         uint32_t by = (v >> (b*8)) & 0xFF;
-                        out[idx] = (int8_t)((int)(by % 127) - 63);
+                        by = (by >= 127) ? by - 127 : by;
+                        by = (by >= 127) ? by - 127 : by;
+                        packed |= (uint32_t)(uint8_t)((int)by - 63) << (b*8);
+                    }
+                    *reinterpret_cast<uint32_t*>(out + woff) = packed;
+                } else {
+                    for (int b = 0; b < 4; ++b) {
+                        long idx = woff + b;
+                        if (idx < n) {
+                            uint32_t by = (v >> (b*8)) & 0xFF;
+                            by = (by >= 127) ? by - 127 : by;
+                            by = (by >= 127) ? by - 127 : by;
+                            out[idx] = (int8_t)((int)by - 63);
+                        }
                     }
                 }
             }
@@ -329,10 +457,29 @@ inline void launch_bseed_expand(const uint8_t* bseed, void* dst, int64_t n,
 // ── k_add_i8 ──────────────────────────────────────────────────────────────
 inline void launch_add_i8(const int8_t* A, const int32_t* E, int8_t* o, int n,
                            sycl::queue* q) {
-    q->parallel_for<KAddI8>(sycl::range<1>((size_t)((n+255)/256)*256),
+    // Vectorized 4 elements/thread (Gemini fix #4): load A as one uint32 (4×int8),
+    // E as one int4 (4×int32), store o as one uint32 → 4× fewer memory ops. Aligned:
+    // A/o+i are 4-aligned, E+i is 16-aligned (i multiple of 4). The tail (n%4) is
+    // handled byte-wise so results are identical to the scalar version.
+    int threads = (n + 3) / 4;
+    q->parallel_for<KAddI8>(sycl::range<1>((size_t)((threads+255)/256)*256),
         [=](sycl::id<1> id) {
-            int i = (int)id[0]; if (i >= n) return;
-            o[i] = (int8_t)((int)A[i] + (int)(int8_t)E[i]);
+            int t = (int)id[0];
+            int i = t * 4;
+            if (i + 4 <= n) {
+                uint32_t a4 = *reinterpret_cast<const uint32_t*>(A + i);
+                sycl::int4 e4 = *reinterpret_cast<const sycl::int4*>(E + i);
+                uint32_t out4 = 0;
+                for (int b = 0; b < 4; ++b) {
+                    int av = (int)(int8_t)((a4 >> (b*8)) & 0xFF);
+                    int ev = (int)(int8_t)e4[b];
+                    out4 |= (uint32_t)(uint8_t)(int8_t)(av + ev) << (b*8);
+                }
+                *reinterpret_cast<uint32_t*>(o + i) = out4;
+            } else if (i < n) {
+                for (; i < n; ++i)
+                    o[i] = (int8_t)((int)A[i] + (int)(int8_t)E[i]);
+            }
         });
 }
 
@@ -346,6 +493,7 @@ inline void launch_transpose_i8(const int8_t* in, int8_t* out, int rows, int col
             out[(size_t)c * rows + r] = in[i];
         });
 }
+
 
 // ── int8 GEMM: C[M,N] = A[M,K] × B[K,N] row-major, result int32 ──────────
 // Used for E_A = EAL[m,R] × EAR_K[R,k].  B is [K,N] (B is EAR_K row-major).
@@ -467,7 +615,8 @@ inline void launch_gemm_i8(const int8_t* A, const int8_t* B, int32_t* C,
 // BLAKE3 PoW check are bit-identical to the scalar reference (validated offline
 // against a scalar transcript). Requires m%16==0, n%(16*NB)==0, k%TK==0 and R a
 // multiple of TK (true for the production shapes: m=4096,n=32768,k=2048,R=128).
-inline void launch_tgemm_pow(const int8_t* ApEA, const int8_t* Bt,
+template<int R_const>
+inline void launch_tgemm_pow_templated(const int8_t* ApEA, const int8_t* Bt,
                               int m, int n, int k, int R,
                               const u32* pow_key, const u32* pow_target,
                               int* host_signal, uint8_t* hdr,
@@ -502,8 +651,8 @@ inline void launch_tgemm_pow(const int8_t* ApEA, const int8_t* Bt,
         static bool dbg_once = false;
         if (!dbg_once) {
             dbg_once = true;
-            fprintf(stderr, "[pearl_sycl dbg] tgemm RM=%d RN=%d SG=%d groups=%dx%d m=%d n=%d k=%d R=%d nStride=%d\n",
-                    RM, RN, SG, numGroupsM, numGroupsN, m, n, k, R, nStride);
+            fprintf(stderr, "[pearl_sycl dbg] tgemm RM=%d RN=%d SG=%d groups=%dx%d m=%d n=%d k=%d R=%d nStride=%d (R_const=%d)\n",
+                    RM, RN, SG, numGroupsM, numGroupsN, m, n, k, R, nStride, R_const);
         }
         q->submit([&](sycl::handler& cgh) {
             sycl::local_accessor<uint32_t, 1> trSlm(RM * RN * 16, cgh);
@@ -531,29 +680,39 @@ inline void launch_tgemm_pow(const int8_t* ApEA, const int8_t* Bt,
 
                     int snap = 0;
 
+                    auto do_ks_step = [&](int kb, int ks) {
+                        int k0 = kb + ks;
+                        // Load A row-block halves once (reused across all RN N-tiles).
+                        for (int r = 0; r < 2 * RM; ++r) {
+                            int row = (grp_row * RM + r / 2) * TILE + (r % 2) * TM;
+                            xmx::joint_matrix_load(sg, mA[r],
+                                sycl::multi_ptr<const int8_t, sycl::access::address_space::global_space>(
+                                    ApEA + (size_t)row * k + k0), (size_t)k);
+                        }
+                        // For each N-fragment: load B once (reused across all MB row-blocks).
+                        for (int t = 0; t < RN * NHALF; ++t) {
+                            int col = (grp_col * RN + t / NHALF) * TILE + (t % NHALF) * TN;
+                            xmx::joint_matrix_load(sg, mB,
+                                sycl::multi_ptr<const int8_t, sycl::access::address_space::global_space>(
+                                    Bt + (size_t)k0 * nStride + col), (size_t)nStride);
+                            for (int r = 0; r < 2 * RM; ++r)
+                                xmx::joint_matrix_mad(sg, mC[r][t], mA[r], mB, mC[r][t]);
+                        }
+                    };
+
+                    const int R_val = R_const > 0 ? R_const : R;
+
                     // Outer loop over R-blocks; inner DPAS k-steps fully unrolled (no
-                    // conditional inside, so the compiler pipelines the DPAS cleanly).
-                    for (int kb = 0; kb < k; kb += R) {
-                        #pragma unroll
-                        for (int ks = 0; ks < R; ks += TK) {
-                            int k0 = kb + ks;
-                            // Load A row-block halves once (reused across all RN N-tiles).
-                            for (int r = 0; r < 2 * RM; ++r) {
-                                int row = (grp_row * RM + r / 2) * TILE + (r % 2) * TM;
-                                xmx::joint_matrix_load(sg, mA[r],
-                                    sycl::multi_ptr<const int8_t, sycl::access::address_space::global_space>(
-                                        ApEA + (size_t)row * k + k0), (size_t)k);
+                     // conditional inside, so the compiler pipelines the DPAS cleanly).
+                    for (int kb = 0; kb < k; kb += R_val) {
+                        if constexpr (R_const > 0) {
+                            #pragma unroll
+                            for (int ks = 0; ks < R_const; ks += TK) {
+                                do_ks_step(kb, ks);
                             }
-                            // For each N-fragment: load B once (reused across all MB row-blocks).
-                            // NHALF==1 (Xe2) keeps the original one-load-per-tile shape;
-                            // NHALF==2 (Xe-HPG) covers each 16-wide tile in two TN=8 halves.
-                            for (int t = 0; t < RN * NHALF; ++t) {
-                                int col = (grp_col * RN + t / NHALF) * TILE + (t % NHALF) * TN;
-                                xmx::joint_matrix_load(sg, mB,
-                                    sycl::multi_ptr<const int8_t, sycl::access::address_space::global_space>(
-                                        Bt + (size_t)k0 * nStride + col), (size_t)nStride);
-                                for (int r = 0; r < 2 * RM; ++r)
-                                    xmx::joint_matrix_mad(sg, mC[r][t], mA[r], mB, mC[r][t]);
+                        } else {
+                            for (int ks = 0; ks < R_val; ks += TK) {
+                                do_ks_step(kb, ks);
                             }
                         }
 
@@ -581,20 +740,15 @@ inline void launch_tgemm_pow(const int8_t* ApEA, const int8_t* Bt,
                     if (lid == 0) {
                         for (int mb = 0; mb < RM; ++mb)
                             for (int t = 0; t < RN; ++t) {
-                                uint8_t tb[64];
-                                for (int e = 0; e < 16; ++e) {
-                                    uint32_t tw = trSlm[(mb * RN + t) * 16 + e];
-                                    tb[e*4]   = (uint8_t)(tw);
-                                    tb[e*4+1] = (uint8_t)(tw >> 8);
-                                    tb[e*4+2] = (uint8_t)(tw >> 16);
-                                    tb[e*4+3] = (uint8_t)(tw >> 24);
-                                }
-                                uint8_t hh[32];
-                                b3::hash_small(tb, 64, pow_key, hh);
+                                // alignas + direct 32-bit word copies (Gemini fix #5):
+                                // LE hardware ⇒ bit-identical to the byte writes, no
+                                // shift/mask. tb stays on thread 0 → no register-file
+                                // blowup. hash_small byte-copies tb internally.
+                                alignas(4) uint8_t tb[64];
+                                for (int e = 0; e < 16; ++e)
+                                    reinterpret_cast<uint32_t*>(tb)[e] = trSlm[(mb * RN + t) * 16 + e];
                                 u32 hw[8];
-                                for (int e = 0; e < 8; ++e)
-                                    hw[e] = (u32)hh[e*4] | ((u32)hh[e*4+1]<<8) |
-                                            ((u32)hh[e*4+2]<<16) | ((u32)hh[e*4+3]<<24);
+                                b3::hash_small_u32(tb, 64, pow_key, hw);
                                 int fnd = 1;
                                 for (int e = 7; e >= 0; --e) {
                                     if (hw[e] > pow_target[e]) { fnd = 0; break; }
@@ -629,9 +783,9 @@ inline void launch_tgemm_pow(const int8_t* ApEA, const int8_t* Bt,
             if constexpr (RM >= 2) {
                 sycl::ext::oneapi::experimental::properties props{
                     sycl::ext::intel::experimental::grf_size<256>};
-                cgh.parallel_for<KTgemmPow<RM, RN, SG>>(ndr, props, kfn);
+                cgh.parallel_for<KTgemmPow<RM, RN, SG, R_const>>(ndr, props, kfn);
             } else {
-                cgh.parallel_for<KTgemmPow<RM, RN, SG>>(ndr, kfn);
+                cgh.parallel_for<KTgemmPow<RM, RN, SG, R_const>>(ndr, kfn);
             }
         });
     };
@@ -676,6 +830,20 @@ inline void launch_tgemm_pow(const int8_t* ApEA, const int8_t* Bt,
     if (is_xe_hpg(q)) dispatchMB(std::integral_constant<int, 8>{},  nbEnv > 0 ? nbEnv : 2, mbEnv > 0 ? mbEnv : 1);
     else              dispatchMB(std::integral_constant<int, 16>{}, nbEnv > 0 ? nbEnv : 4, mbEnv > 0 ? mbEnv : 2);
 #endif
+}
+
+inline void launch_tgemm_pow(const int8_t* ApEA, const int8_t* Bt,
+                              int m, int n, int k, int R,
+                              const u32* pow_key, const u32* pow_target,
+                              int* host_signal, uint8_t* hdr,
+                              sycl::queue* q, int nStride = 0) {
+    if (R == 256) {
+        launch_tgemm_pow_templated<256>(ApEA, Bt, m, n, k, R, pow_key, pow_target, host_signal, hdr, q, nStride);
+    } else if (R == 128) {
+        launch_tgemm_pow_templated<128>(ApEA, Bt, m, n, k, R, pow_key, pow_target, host_signal, hdr, q, nStride);
+    } else {
+        launch_tgemm_pow_templated<0>(ApEA, Bt, m, n, k, R, pow_key, pow_target, host_signal, hdr, q, nStride);
+    }
 }
 
 } // namespace pk

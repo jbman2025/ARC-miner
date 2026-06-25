@@ -101,7 +101,9 @@ internal sealed class WorkerBuffers : IDisposable
         long bEAL        = (long)M * R;
         long bEAR_R      = (long)K * R;
         long bEAR_K      = (long)R * K;
+#if !SYCL_BACKEND
         long bAxEBLFp16  = (long)M * R * 2;
+#endif
         long aLeafCvsBytes = ((bA + Blake3.ChunkLen - 1) / Blake3.ChunkLen) * Blake3.DigestSize;
         // Sized for the MOST rows a trigger header can open (256 u8 thread_rows
         // slots), NOT MiningConfiguration.DefaultRowsIndices. The H100 default
@@ -127,7 +129,17 @@ internal sealed class WorkerBuffers : IDisposable
         EALFp16   = AllocZero(bEAL * 2);
         EAR_R     = AllocZero(bEAR_R);
         EAR_K     = AllocZero(bEAR_K);
+#if SYCL_BACKEND
+        // Gemini VRAM opt #3: the SYCL mining kernel never reads AxEBL_fp16. The
+        // CUDA-only AxEBL projection is bypassed on Arc (pearl_capi_noisy_gemm is
+        // a stub and pearl_capi_iter ignores the pointer), so this M*R*2 buffer
+        // (~67 MiB/half, ~134 MiB/worker) is dead VRAM. Skip it and pass null —
+        // useful headroom on 8 GB A750/A770. CUDA/ROCm still allocate it below
+        // (those backends use it), so the saving is gated to the SYCL build.
+        AxEBLFp16 = default;
+#else
         AxEBLFp16 = AllocZero(bAxEBLFp16);
+#endif
         ApEA      = AllocZero(bA);
         AScales   = AllocFp32Ones(M);
         // The pure-miner CAPI path is headless and passes C=nullptr into the

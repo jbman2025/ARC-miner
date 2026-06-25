@@ -91,9 +91,11 @@ Within a minute you should see the GPU detected, a short benchmark, `✓ connect
 [`docs/POOLS.md`](docs/POOLS.md) for more pools and [`MINING-GUIDE.md`](MINING-GUIDE.md)
 for the full Windows user guide.
 
-> **Tune first (optional but recommended):** `arc-miner.exe autotune` finds and
-> caches the best kernel config for your exact card, then `arc-miner.exe …` mines
-> with it automatically.
+> **Auto-tunes itself on first run.** The first time you mine on a given card,
+> ARC-miner runs a one-time autotune sweep, caches the best kernel config, and
+> mines with it (every later launch just loads the cache). This matters most on
+> **A-series** cards, which are ~25× slower at the default window. Skip it with
+> `--no-autotune`, or re-tune anytime with `arc-miner.exe autotune`.
 
 ---
 

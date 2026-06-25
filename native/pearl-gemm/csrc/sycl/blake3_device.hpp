@@ -53,7 +53,11 @@ inline void compress_full(const u32 cv_in[8], const u32 block_in[16],
 }
 
 inline u32 load_le32(const uint8_t* p) {
-    return (u32)p[0] | ((u32)p[1]<<8) | ((u32)p[2]<<16) | ((u32)p[3]<<24);
+    // Direct aligned 32-bit read (Gemini fix #1). Intel Arc is little-endian, so
+    // this is bit-identical to the byte-assembled form and skips the shift/OR
+    // sequence. REQUIRES p to be 4-byte aligned — all call sites read from
+    // alignas(4) stack buffers (bf/tb) or 4-aligned device buffers.
+    return *reinterpret_cast<const u32*>(p);
 }
 inline void init_cv(u32 cv[8], const u32* key) {
     if (key) { for (int i = 0; i < 8; ++i) cv[i] = key[i]; }
@@ -71,7 +75,7 @@ inline void hash_small(const uint8_t* data, int len, const u32* key, uint8_t out
     u32 cv[8]; init_cv(cv, key);
     int nb = (len + 63) / 64; if (!nb) nb = 1;
     for (int b = 0; b < nb; ++b) {
-        u32 bl[16]; uint8_t bf[64];
+        u32 bl[16]; alignas(4) uint8_t bf[64];   // alignas for aligned load_le32 (Gemini fix #1)
         for (int j = 0; j < 64; ++j) bf[j] = (b*64+j < len) ? data[b*64+j] : 0;
         for (int j = 0; j < 16; ++j) bl[j] = load_le32(bf + j*4);
         int blen = len - b*64; if (blen > 64) blen = 64; if (blen < 0) blen = 0;
@@ -81,6 +85,23 @@ inline void hash_small(const uint8_t* data, int len, const u32* key, uint8_t out
         compress(cv, bl, 0ULL, (u32)blen, f);
     }
     cv_to_bytes(cv, out);
+}
+
+// Single-chunk (≤1024 B) keyed/unkeyed BLAKE3 ROOT hash returning u32[8] directly.
+inline void hash_small_u32(const uint8_t* data, int len, const u32* key, u32 out[8]) {
+    u32 cv[8]; init_cv(cv, key);
+    int nb = (len + 63) / 64; if (!nb) nb = 1;
+    for (int b = 0; b < nb; ++b) {
+        u32 bl[16]; alignas(4) uint8_t bf[64];
+        for (int j = 0; j < 64; ++j) bf[j] = (b*64+j < len) ? data[b*64+j] : 0;
+        for (int j = 0; j < 16; ++j) bl[j] = load_le32(bf + j*4);
+        int blen = len - b*64; if (blen > 64) blen = 64; if (blen < 0) blen = 0;
+        u32 f = (key ? KEYED_HASH : (u32)0);
+        if (b == 0) f |= CHUNK_START;
+        if (b == nb-1) f |= CHUNK_END | ROOT;
+        compress(cv, bl, 0ULL, (u32)blen, f);
+    }
+    for (int i = 0; i < 8; ++i) out[i] = cv[i];
 }
 
 // Hash one full 1024-byte chunk (counter = chunk index).

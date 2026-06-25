@@ -437,6 +437,12 @@ internal sealed partial class GpuWorker : IAsyncDisposable, ILivenessTarget
             TouchProgress();
             ValidateCtaTileDivisibility(_mine.M, _mine.N, _mine.BM, _mine.BN);
 
+            // Per-session winSeed base (see NextWinSeedBase). Captured once so the
+            // stats baseline starts from the SAME value as GlobalIterIdx — otherwise
+            // the very first report computes dIters = GlobalIterIdx - 0 (a huge base)
+            // and prints a phantom multi-EH/s hashrate.
+            var iterBase = NextWinSeedBase(_gpuIndex);
+
             state = new WorkerState
             {
                 MiningConfig   = MiningConfiguration.Default(firstCtx.CommonDim, firstCtx.Rank),
@@ -475,7 +481,10 @@ internal sealed partial class GpuWorker : IAsyncDisposable, ILivenessTarget
                 //  The base ALSO folds in a per-session epoch (see
                 //  NextWinSeedBase) so a reconnect/restart does not re-walk the
                 //  same seeds and resubmit duplicate shares under an unchanged σ.
-                GlobalIterIdx = NextWinSeedBase(_gpuIndex),
+                GlobalIterIdx = iterBase,
+                // Start the stats baseline at the same base → no phantom EH/s on
+                // the first report (Gemini fix #6).
+                ItersAtLastReport = iterBase,
             };
             state.Ping.Stream = stream0;
             state.Pong.Stream = stream1;
@@ -1539,10 +1548,14 @@ internal sealed partial class GpuWorker : IAsyncDisposable, ILivenessTarget
         // Console: headline hashrate first, then the figures an operator cares
         // about. The fuller diagnostics (tiles/s, tmads/s, expected_opens/s) stay
         // in the Prometheus snapshot below rather than cluttering every line.
-        _log.LogInformation(
-            "worker[{Gpu}] hashrate={Hps} diff={Diff} iter_ms={Ms:F1} iters/s={Ips:F1} shares={Sh} triggers={Trig} σ_age={Age:F0}s",
-            _gpuIndex, FormatHashRate(hashesPerSec), FormatDifficulty(s.InstalledTargetNbits), iterMs, ips,
-            s.SharesEmitted, s.TriggersTotal, ElapsedSecondsSince(s.SigmaInstalledAtTimestamp));
+        // When the live dashboard is active this line is redundant with the
+        // per-GPU table it renders, so we skip it (but still update Metrics
+        // below — the dashboard reads its hashrate/iter_ms from there).
+        if (!Dashboard.Active)
+            _log.LogInformation(
+                "worker[{Gpu}] hashrate={Hps} diff={Diff} iter_ms={Ms:F1} iters/s={Ips:F1} shares={Sh} triggers={Trig} σ_age={Age:F0}s",
+                _gpuIndex, FormatHashRate(hashesPerSec), FormatDifficulty(s.InstalledTargetNbits), iterMs, ips,
+                s.SharesEmitted, s.TriggersTotal, ElapsedSecondsSince(s.SigmaInstalledAtTimestamp));
 
         Metrics.SetThroughput(_gpuIndex, ips, tmadsPerSec, hashesPerSec, iterMs,
             tilesPerSec, expectedOpensPerSec);

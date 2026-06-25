@@ -882,7 +882,9 @@ internal sealed class WorkerOrchestrator : IAsyncDisposable
         {
             var path = Autotune.TuneCache.PathFor(_opts.Session.FilePath);
             var sku = gpus[0].Name;
-            if (Autotune.TuneCache.Lookup(path, sku) is not { } t) return;
+            // Cache wins, else the built-in per-SKU default (so a known card mines
+            // optimally even on a brand-new install with no autotune run).
+            if (Autotune.ResolveTunedConfig(path, sku) is not { } t) return;
 
             var applied = new List<string>(3);
             ApplyKnob("AKOYA_TGEMM_NB", t.Nb, applied);

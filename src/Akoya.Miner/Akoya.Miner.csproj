@@ -17,6 +17,13 @@
     <DefineConstants>$(DefineConstants);PERF_TIMINGS</DefineConstants>
   </PropertyGroup>
 
+  <!-- Set by build.ps1 (-p:AkoyaBackend=sycl) so backend-specific managed code
+       can be gated. SYCL_BACKEND drops the AxEBL_fp16 buffer the Arc kernel
+       never reads (see WorkerBuffers). Defaults off → CUDA/ROCm behaviour. -->
+  <PropertyGroup Condition="'$(AkoyaBackend)' == 'sycl'">
+    <DefineConstants>$(DefineConstants);SYCL_BACKEND</DefineConstants>
+  </PropertyGroup>
+
   <ItemGroup>
     <ProjectReference Include="..\Akoya.Crypto\Akoya.Crypto.csproj" />
     <ProjectReference Include="..\Akoya.Cuda\Akoya.Cuda.csproj" />

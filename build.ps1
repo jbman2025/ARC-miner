@@ -323,9 +323,16 @@ if ($Backend -eq 'sycl') {
   }
 }
 Say "Publishing akoya-miner.exe (Native AOT, $Rid)"
-if (Test-Path $Out) { Remove-Item $Out -Recurse -Force }
+if (Test-Path $Out) {
+  try {
+    Remove-Item $Out -Recurse -Force -ErrorAction Stop
+  } catch {
+    Get-ChildItem $Out | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+  }
+}
 dotnet publish (Join-Path $root 'src\Akoya.Miner\Akoya.Miner.csproj') `
   -c $Config -r $Rid --self-contained true -p:PublishAot=true `
+  -p:AkoyaBackend=$Backend `
   -p:DebugType=none -p:DebugSymbols=false -o $Out
 if ($LASTEXITCODE -ne 0) { Die 'dotnet publish failed' }
 Get-ChildItem $Out -Filter *.pdb | Remove-Item -Force -ErrorAction SilentlyContinue

@@ -277,6 +277,22 @@ else
             // bundling launchers (e.g. Kryptex) can enable it per-invocation.
             Environment.SetEnvironmentVariable("AKOYA_METRICS_PORT", args[++i]);
         }
+        else if (arg == "--no-autotune")
+        {
+            // Skip the one-time first-run autotune sweep (mine with defaults /
+            // any cached profile). Same as AKOYA_AUTOTUNE_ON_FIRST_RUN=0.
+            Environment.SetEnvironmentVariable("AKOYA_AUTOTUNE_ON_FIRST_RUN", "0");
+        }
+        else if (arg == "--dashboard")
+        {
+            // Opt-in live in-place TUI dashboard (rig summary + per-GPU table +
+            // recent events) instead of the scrolling log. Same as
+            // AKOYA_DASHBOARD=1. Ignored when stdout is redirected or JSON
+            // logging is on. Optional refresh interval: "--dashboard 500" (ms).
+            Environment.SetEnvironmentVariable("AKOYA_DASHBOARD", "1");
+            if (i + 1 < args.Length && int.TryParse(args[i + 1], out _))
+                Environment.SetEnvironmentVariable("AKOYA_DASHBOARD_REFRESH_MS", args[++i]);
+        }
     }
 }
 
@@ -298,9 +314,14 @@ static int RunAutotune(string[] args)
     return Akoya.Miner.Mining.Autotune.Run(args, loggerFactory, cts.Token);
 }
 
-static async Task<int> MineBlocksAsync(string[] _)
+static async Task<int> MineBlocksAsync(string[] args)
 {
-    PrintAsciiBanner();
+    // Arm the live dashboard before anything prints: when active it owns the
+    // screen, so the static ASCII banner is skipped (the panel draws its own
+    // title). TryEnable returns false for redirected stdout / JSON logging.
+    bool jsonLog = (Akoya.Crypto.MinerEnv.Get("AKOYA_LOG_JSON") ?? "0") is "1" or "true";
+    bool dashboard = Akoya.Miner.Observability.Dashboard.TryEnable(jsonLog);
+    if (!dashboard) PrintAsciiBanner();
     using var loggerFactory = BuildLoggerFactory();
     var log = loggerFactory.CreateLogger("startup");
 
@@ -389,6 +410,12 @@ static async Task<int> MineBlocksAsync(string[] _)
         Metrics.TryStart(port, loggerFactory.CreateLogger("metrics"), cts.Token);
     }
 
+    // Zero-config tuning: on the first run for this GPU (no cached profile),
+    // run the autotune sweep once before mining so A-series cards don't mine at
+    // the B-series default window (~25× slower). A cache hit makes this a no-op;
+    // the mine path then applies the cached profile. Opt out: --no-autotune.
+    Akoya.Miner.Mining.Autotune.EnsureTunedOrSweep(args, opts, loggerFactory, cts.Token);
+
     // Reconnect loop: any unhandled stream exit (graceful, RpcException,
     // stream-watchdog cancellation, worker-watchdog cancellation) triggers a
     // jittered exponential backoff + Resume attempt. Fatal config errors
@@ -409,7 +436,12 @@ static async Task<int> MineBlocksAsync(string[] _)
     var sessionClock = Stopwatch.StartNew();
     var summaryLog = loggerFactory.CreateLogger("session");
     using var summaryCts = CancellationTokenSource.CreateLinkedTokenSource(cts.Token);
-    var summaryTask = SessionSummaryLoop(sessionClock, summaryLog, summaryCts.Token);
+    // With the dashboard active, its in-place panel already shows uptime /
+    // totals / rig hashrate continuously, so we run the render loop in place of
+    // the periodic one-line session rollup.
+    var summaryTask = dashboard
+        ? Akoya.Miner.Observability.Dashboard.RunAsync(sessionClock, summaryCts.Token)
+        : SessionSummaryLoop(sessionClock, summaryLog, summaryCts.Token);
 
     while (!cts.IsCancellationRequested)
     {
@@ -580,6 +612,7 @@ static int Usage(string? c)
     Console.Error.WriteLine("usage: arc-miner [mine-blocks|selftest|version] [options]");
     Console.Error.WriteLine("  mine-blocks  Connect to pool, register/resume, mine. (default)");
     Console.Error.WriteLine("  autotune     Sweep kernel knobs (NB/MB/SEARCH_M) on this GPU, print + cache the best config.");
+    Console.Error.WriteLine("               flags: --autotune-deep (exhaustive grid), --autotune-max-search-m <n>, --autotune-duration <s>");
     Console.Error.WriteLine("  selftest     Validate config + pool + native libs + session store; emit JSON; exit 0/1.");
     Console.Error.WriteLine("  version      Print git sha + miner version.");
     Console.Error.WriteLine("options:");
@@ -594,7 +627,9 @@ static int Usage(string? c)
     Console.Error.WriteLine("  --budget <ms>          Override benchmark target trigger budget in ms");
     Console.Error.WriteLine("  --keepalive [sec]      Enable stratum keepalive re-auth (default off; interval 120s)");
     Console.Error.WriteLine("  --api-port <port>      Enable local HTTP stats API (JSON /api/stats, Prometheus /metrics)");
-    Console.Error.WriteLine("note: V2 is pool-only; there is no solo/direct mining mode.");
+    Console.Error.WriteLine("  --dashboard [ms]       Live in-place TUI dashboard (rig + per-GPU table + events) instead of scrolling log");
+    Console.Error.WriteLine("  --no-autotune          Skip the one-time first-run autotune sweep (mine with defaults/cache)");
+    Console.Error.WriteLine("note: first run auto-tunes once (cached); especially important on A-series. V2 is pool-only.");
     return c is null ? 0 : 64;   // explicit --help is success; unknown subcommand is EX_USAGE
 }
 

@@ -21,8 +21,12 @@
 #include <sycl/sycl.hpp>
 #include <mutex>
 #include <chrono>
+#include <unordered_map>
 
 #define HQUEUE(s) static_cast<sycl::queue*>(s)
+
+static std::mutex g_seed_mutex;
+static std::unordered_map<sycl::queue*, uint64_t> g_last_base_seed;
 
 static inline int rc_sycl(const char* where) {
     fprintf(stderr, "[pearl_sycl] error in %s\n", where);
@@ -70,6 +74,7 @@ static int compute_search_m(int m) {
     return sm;
 }
 
+
 extern "C" {
 
 PEARL_EXPORT int pearl_capi_abi_version(void) { return 2; }
@@ -100,7 +105,19 @@ PEARL_EXPORT int64_t pearl_capi_get_required_scratchpad_bytes(int64_t matrix_byt
 PEARL_EXPORT int pearl_capi_lcg_int7_fill(void* dst, int64_t n,
                               uint64_t seed_lo, uint64_t seed_hi, void* stream) {
     try {
-        pk::launch_lcg_int7_fill(dst, n, seed_lo, seed_hi, HQUEUE(stream));
+        auto splitmix = [](uint64_t z) -> uint64_t {
+            z += 0x9E3779B97F4A7C15ULL;
+            z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+            z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+            return z ^ (z >> 31);
+        };
+        uint64_t base = splitmix(seed_lo ^ splitmix(seed_hi));
+        auto* q = HQUEUE(stream);
+        {
+            std::lock_guard<std::mutex> lock(g_seed_mutex);
+            g_last_base_seed[q] = base;
+        }
+        pk::launch_lcg_int7_fill(dst, n, base, q);
         return 0;
     } catch (...) { return rc_sycl("lcg_int7_fill"); }
 }
@@ -113,8 +130,22 @@ PEARL_EXPORT int pearl_capi_tensor_hash(const uint8_t* data, uint32_t data_size,
                             const uint8_t* key, uint32_t, uint32_t, uint32_t, uint32_t,
                             uint8_t* roots, int, void* stream) {
     try {
+        auto* q = HQUEUE(stream);
+        uint64_t base = 0;
+        bool has_base = false;
+        {
+            std::lock_guard<std::mutex> lock(g_seed_mutex);
+            auto it = g_last_base_seed.find(q);
+            if (it != g_last_base_seed.end()) {
+                base = it->second;
+                has_base = true;
+            }
+        }
+        if (has_base) {
+            pk::launch_lcg_int7_fill(const_cast<uint8_t*>(data), (int64_t)data_size, base, q);
+        }
         pk::parallel_tensor_hash(data, (long)data_size, (const u32*)key,
-                                 (u32*)roots, out, HQUEUE(stream));
+                                 (u32*)roots, out, q);
         return 0;
     } catch (...) { return rc_sycl("tensor_hash"); }
 }
@@ -123,8 +154,22 @@ PEARL_EXPORT int pearl_capi_tensor_hash_leaf_cvs(const uint8_t* d, uint32_t s, u
                                      const uint8_t* k, uint32_t, uint32_t, uint32_t, uint32_t,
                                      uint8_t* r, uint8_t* leaf_cvs, int, void* st) {
     try {
+        auto* q = HQUEUE(st);
+        uint64_t base = 0;
+        bool has_base = false;
+        {
+            std::lock_guard<std::mutex> lock(g_seed_mutex);
+            auto it = g_last_base_seed.find(q);
+            if (it != g_last_base_seed.end()) {
+                base = it->second;
+                has_base = true;
+            }
+        }
+        if (has_base) {
+            pk::launch_lcg_int7_fill(const_cast<uint8_t*>(d), (int64_t)s, base, q);
+        }
         pk::parallel_tensor_hash(d, (long)s, (const u32*)k, (u32*)r, o,
-                                 HQUEUE(st), leaf_cvs);
+                                 q, leaf_cvs);
         return 0;
     } catch (...) { return rc_sycl("tensor_hash_leaf_cvs"); }
 }
@@ -254,13 +299,21 @@ PEARL_EXPORT int pearl_capi_iter(void* ws, uint64_t seed_lo,
     auto lap = [&](int i){ if (g_prof){ q->wait();
         acc[i] += std::chrono::duration<double,std::milli>(clk::now()-t0).count(); t0 = clk::now(); } };
 
-    // 1. A = lcg
-    pearl_capi_lcg_int7_fill(p.A, (int64_t)m * k, seed_lo, p.sigma_seed, stream);
+    // 1 & 2. Fused LCG and Tensor Hash
+    auto splitmix = [](uint64_t z) -> uint64_t {
+        z += 0x9E3779B97F4A7C15ULL;
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+        return z ^ (z >> 31);
+    };
+    uint64_t base = splitmix(seed_lo ^ splitmix(p.sigma_seed));
+    {
+        std::lock_guard<std::mutex> lock(g_seed_mutex);
+        g_last_base_seed[q] = base;
+    }
+    pk::parallel_tensor_hash_fused((uint8_t*)p.A, (long)m * k, (const u32*)p.Key,
+                                   (u32*)p.Roots, (uint8_t*)p.AHash, q, base, (long)sm * k);
     lap(0);
-
-    // 2. AHash = tensor_hash(A)
-    pk::parallel_tensor_hash((const uint8_t*)p.A, (long)m * k, (const u32*)p.Key,
-                             (u32*)p.Roots, (uint8_t*)p.AHash, q);
     lap(1);
 
     // 3. commitment
@@ -286,8 +339,8 @@ PEARL_EXPORT int pearl_capi_iter(void* ws, uint64_t seed_lo,
                       sm * k, q);
     lap(5);
 
-    // 6b. Transpose BpEB[n,k] → Bt[k,n] once per σ (BpEB is constant across the
-    //     thousands of iters in a σ period). The XMX tgemm then loads B with a
+    // 6b. Transpose BpEB[n,k] → Bt[k,n] once per Iter (BpEB is constant across the
+    //     thousands of iters in a Iter period). The XMX tgemm then loads B with a
     //     fast row-major layout instead of a strided col-major load.
     if (!w->bt_valid) {
         pk::launch_transpose_i8((const int8_t*)p.BpEB, w->Bt, n, k, q);

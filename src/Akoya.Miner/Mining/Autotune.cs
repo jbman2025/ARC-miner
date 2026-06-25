@@ -29,6 +29,55 @@ internal static class Autotune
 
     private readonly record struct Sample(Config Cfg, double Tmads, double IterMs, bool Ok);
 
+    // ── built-in tuned defaults ───────────────────────────────────────────────
+    // Per-SKU optima we've already characterized, so users never wait on autotune
+    // for a known card. Alchemist (sg8) is register-bound with a tiny L2 → a small
+    // SEARCH_M window; confirmed on A750 (3.8 TH/s @ 256/NB2/MB2). A770/A580/A380
+    // share the die + small-window regime, seeded from it (re-tune to refine).
+    // Battlemage B580/B570 (sg16) want the 4096 L2-resident window (B580 34.8 TH/s).
+    // B70 (BMG-G31) has a big L2 and peaks higher — intentionally absent so it
+    // autotunes. Keyed by the model token in the GPU name (A750, B580, …).
+    private static readonly Dictionary<string, Config> SkuDefaults = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["A770"] = new Config(2, 2, 256),
+        ["A750"] = new Config(2, 2, 256),
+        ["A580"] = new Config(2, 2, 256),
+        ["A380"] = new Config(2, 2, 256),
+        ["B580"] = new Config(4, 2, 4096),
+        ["B570"] = new Config(4, 2, 4096),
+    };
+
+    // Extract the Arc model token (A750 / B580 / …) from a device name.
+    private static string? ModelToken(string? gpuName)
+    {
+        var m = System.Text.RegularExpressions.Regex.Match(gpuName ?? "", @"\b([AB]\d{2,3})\b");
+        return m.Success ? m.Groups[1].Value : null;
+    }
+
+    // "acm" (Alchemist / sg8) | "bmg" (Battlemage / sg16) | "" (unknown).
+    private static string ArcFamily(string? gpuName)
+    {
+        var t = ModelToken(gpuName);
+        return t is null ? "" : (t[0] == 'A' ? "acm" : "bmg");
+    }
+
+    private static Config? SkuDefaultFor(string? gpuName)
+        => ModelToken(gpuName) is { } tok && SkuDefaults.TryGetValue(tok, out var c) ? c : null;
+
+    /// <summary>The effective tuned config for a SKU: the autotune cache if
+    /// present, else the built-in default, else null (truly unknown card).
+    /// Single source of truth for both the first-run hook and the mine-path
+    /// apply step.</summary>
+    internal static (int Nb, int Mb, int SearchM)? ResolveTunedConfig(string cachePath, string sku)
+    {
+        if (TuneCache.Lookup(cachePath, sku) is { } t) return t;
+        if (SkuDefaultFor(sku) is { } d) return (d.Nb, d.Mb, d.SearchM);
+        return null;
+    }
+
+    private static bool HasFlag(string[] args, string flag)
+        => Array.IndexOf(args, flag) >= 0;
+
     public static int Run(string[] args, ILoggerFactory lf, CancellationToken ct)
     {
         var log = lf.CreateLogger("autotune");
@@ -56,8 +105,20 @@ internal static class Autotune
         var savedMb = Environment.GetEnvironmentVariable("AKOYA_TGEMM_MB");
         var savedSm = Environment.GetEnvironmentVariable("AKOYA_SEARCH_M");
 
-        int maxSm = Math.Max(256, ArgInt(args, "--autotune-max-search-m", DefaultMaxSearchM));
-        int probe = AlignSm(Math.Min(ProbeSearchM, maxSm), profile.M);
+        // Arch-aware bounds. sg8 (Alchemist) is register-bound with a tiny L2 →
+        // its optimum is a SMALL window, so start the probe low and cap the ladder
+        // low: never measure the catastrophically slow large windows (4096 ≈ 16s/
+        // iter on an A750, and the up-climb to 8192+ risks the Windows TDR). sg16
+        // (Battlemage) wants the 4096 L2-resident window; B70 (BMG-G31) peaks
+        // higher and its DefaultMaxSearchM cap lets the climb reach it.
+        string family = ArcFamily(gpus[0].Name);
+        bool deep = HasFlag(args, "--autotune-deep");
+        int defMaxSm = family == "acm" ? 2048 : DefaultMaxSearchM;
+        int defProbe = family == "acm" ? 256  : ProbeSearchM;
+        int maxSm = Math.Max(64, ArgInt(args, "--autotune-max-search-m", defMaxSm));
+        int probe = AlignSm(Math.Min(defProbe, maxSm), profile.M);
+        if (deep)
+            log.LogInformation("autotune: DEEP mode — full NB·MB·SEARCH_M grid (≤{Max}); characterization sweep, slower.", maxSm);
         var winners = new List<(WorkerOrchestrator.GpuInfo Gpu, Sample Best, List<Sample> All)>();
 
         try
@@ -88,47 +149,74 @@ internal static class Autotune
                     }
                 }
 
-                // Phase 1 — rank NB/MB at the probe window. These register/reuse
-                // levers are ~orthogonal to SEARCH_M (verified on B580: NB=4 MB=2
-                // led at every window), so ranking them once is enough.
-                log.LogInformation(
-                    "autotune: GPU{Ord} \"{Name}\" — phase 1/2: NB·MB @ SEARCH_M={Sm} ({Sec}s each)",
-                    gpu.Ordinal, gpu.Name, probe, durSec);
-                foreach (var mb in new[] { 1, 2 })
-                    foreach (var nb in new[] { 2, 4 })
-                    {
-                        if (ct.IsCancellationRequested) break;
-                        Measure(new Config(nb, mb, probe));
-                    }
-
-                if (!samples.Any(s => s.Ok)) { log.LogWarning("autotune: GPU{Ord} produced no valid samples", gpu.Ordinal); continue; }
-                var lead = PickBest(samples);
-                int pnb = lead.Cfg.Nb, pmb = lead.Cfg.Mb;
-
-                // Phase 2 — climb SEARCH_M from the probe in BOTH directions with
-                // the winning NB/MB. The L2-residency optimum sits below the probe
-                // on small-L2 parts (A-series) and well above it on big-L2 parts
-                // (Pro B70 / BMG-G31), so we walk up AND down, stopping each
-                // direction at the cliff (throughput drops >DropTol below that
-                // direction's running peak), the TDR guard, or an alloc failure.
-                log.LogInformation("autotune: GPU{Ord} — phase 2/2: climbing SEARCH_M from {P} with NB={Nb} MB={Mb}",
-                    gpu.Ordinal, probe, pnb, pmb);
-                var above = SearchMLadder.Where(x => x > probe).OrderBy(x => x).ToArray();
-                var below = SearchMLadder.Where(x => x < probe).OrderByDescending(x => x).ToArray();
-                foreach (var dir in new[] { above, below })
+                if (deep)
                 {
-                    double peak = lead.Tmads;
-                    foreach (var smRaw in dir)
+                    // DEEP / characterization: exhaustive NB·MB·SEARCH_M grid over
+                    // the arch-appropriate region — no adaptive pruning, so the full
+                    // landscape lands in the report. The GRF axis is covered
+                    // implicitly: MB=2 ⇒ the kernel's RM>=2 path carries
+                    // grf_size<256> (large GRF); MB=1 ⇒ 128-GRF. This CONFIRMS the
+                    // max within the runtime-tunable space; it can't beat the
+                    // adaptive winner on the current kernel.
+                    var rungs = SearchMLadder.Where(x => x <= maxSm)
+                                             .Select(x => AlignSm(x, profile.M))
+                                             .Distinct().ToArray();
+                    log.LogInformation(
+                        "autotune: GPU{Ord} \"{Name}\" — DEEP grid: {N} SEARCH_M rungs × MB{{1,2}} × NB{{1,2,4}} ({Sec}s each)",
+                        gpu.Ordinal, gpu.Name, rungs.Length, durSec);
+                    foreach (var sm in rungs)
+                        foreach (var mb in new[] { 1, 2 })
+                            foreach (var nb in new[] { 1, 2, 4 })
+                            {
+                                if (ct.IsCancellationRequested) break;
+                                Measure(new Config(nb, mb, sm));
+                            }
+                    if (!samples.Any(s => s.Ok)) { log.LogWarning("autotune: GPU{Ord} produced no valid samples", gpu.Ordinal); continue; }
+                }
+                else
+                {
+                    // Phase 1 — rank NB/MB at the probe window. These register/reuse
+                    // levers are ~orthogonal to SEARCH_M (verified on B580: NB=4 MB=2
+                    // led at every window), so ranking them once is enough.
+                    log.LogInformation(
+                        "autotune: GPU{Ord} \"{Name}\" — phase 1/2: NB·MB @ SEARCH_M={Sm} ({Sec}s each)",
+                        gpu.Ordinal, gpu.Name, probe, durSec);
+                    foreach (var mb in new[] { 1, 2 })
+                        foreach (var nb in new[] { 2, 4 })
+                        {
+                            if (ct.IsCancellationRequested) break;
+                            Measure(new Config(nb, mb, probe));
+                        }
+
+                    if (!samples.Any(s => s.Ok)) { log.LogWarning("autotune: GPU{Ord} produced no valid samples", gpu.Ordinal); continue; }
+                    var lead = PickBest(samples);
+                    int pnb = lead.Cfg.Nb, pmb = lead.Cfg.Mb;
+
+                    // Phase 2 — climb SEARCH_M from the probe in BOTH directions with
+                    // the winning NB/MB. The L2-residency optimum sits below the probe
+                    // on small-L2 parts (A-series) and well above it on big-L2 parts
+                    // (Pro B70 / BMG-G31), so we walk up AND down, stopping each
+                    // direction at the cliff (throughput drops >DropTol below that
+                    // direction's running peak), the TDR guard, or an alloc failure.
+                    log.LogInformation("autotune: GPU{Ord} — phase 2/2: climbing SEARCH_M from {P} with NB={Nb} MB={Mb}",
+                        gpu.Ordinal, probe, pnb, pmb);
+                    var above = SearchMLadder.Where(x => x > probe).OrderBy(x => x).ToArray();
+                    var below = SearchMLadder.Where(x => x < probe).OrderByDescending(x => x).ToArray();
+                    foreach (var dir in new[] { above, below })
                     {
-                        if (ct.IsCancellationRequested) break;
-                        if (smRaw > maxSm) break;                       // up-direction cap (never trips going down)
-                        int sm = AlignSm(smRaw, profile.M);
-                        if (samples.Any(s => s.Cfg.SearchM == sm && s.Cfg.Nb == pnb && s.Cfg.Mb == pmb)) continue;
-                        var s = Measure(new Config(pnb, pmb, sm));
-                        if (!s.Ok) break;                               // OOM / alloc cap → stop this direction
-                        if (s.IterMs > TdrGuardMs) break;               // nearing the ~2s Windows TDR
-                        if (s.Tmads < peak * (1.0 - DropTol)) break;    // past the L2 cliff
-                        if (s.Tmads > peak) peak = s.Tmads;
+                        double peak = lead.Tmads;
+                        foreach (var smRaw in dir)
+                        {
+                            if (ct.IsCancellationRequested) break;
+                            if (smRaw > maxSm) break;                       // up-direction cap (never trips going down)
+                            int sm = AlignSm(smRaw, profile.M);
+                            if (samples.Any(s => s.Cfg.SearchM == sm && s.Cfg.Nb == pnb && s.Cfg.Mb == pmb)) continue;
+                            var s = Measure(new Config(pnb, pmb, sm));
+                            if (!s.Ok) break;                               // OOM / alloc cap → stop this direction
+                            if (s.IterMs > TdrGuardMs) break;               // nearing the ~2s Windows TDR
+                            if (s.Tmads < peak * (1.0 - DropTol)) break;    // past the L2 cliff
+                            if (s.Tmads > peak) peak = s.Tmads;
+                        }
                     }
                 }
 
@@ -156,6 +244,73 @@ internal static class Autotune
         catch (Exception e) { log.LogWarning("autotune: could not write cache — {Err}", e.Message); }
 
         return 0;
+    }
+
+    /// <summary>
+    /// Zero-config tuning hook for the mine path. If this GPU has no cached tune
+    /// profile yet, run the autotune sweep once (caching the result) BEFORE
+    /// mining, so a first run — A-series especially — does not mine at the
+    /// B-series default window (~25× slower). On later launches the cache hit
+    /// makes this a no-op and the mine path applies the cached profile.
+    ///
+    /// Opt out with <c>--no-autotune</c> / <c>AKOYA_AUTOTUNE_ON_FIRST_RUN=0</c>;
+    /// skipped if the user pinned any kernel knob (NB/MB/SEARCH_M). Never fatal —
+    /// a sweep failure just falls through to mining with defaults.
+    /// </summary>
+    public static void EnsureTunedOrSweep(
+        string[] args, MinerOptions opts, ILoggerFactory lf, CancellationToken ct)
+    {
+        var log = lf.CreateLogger("autotune");
+
+        if (MinerEnv.Get("AKOYA_AUTOTUNE_ON_FIRST_RUN") == "0")
+            return;
+        if (!string.IsNullOrEmpty(MinerEnv.Get("AKOYA_TGEMM_NB"))
+            || !string.IsNullOrEmpty(MinerEnv.Get("AKOYA_TGEMM_MB"))
+            || !string.IsNullOrEmpty(MinerEnv.Get("AKOYA_SEARCH_M")))
+        {
+            log.LogInformation("autotune: kernel knobs set manually — skipping first-run autotune");
+            return;
+        }
+
+        List<WorkerOrchestrator.GpuInfo> gpus;
+        try { gpus = EnumerateGpus(); }
+        catch { return; }                  // non-Arc / enumeration issue → skip silently
+        if (gpus.Count == 0) return;
+
+        var cachePath = TuneCache.PathFor(opts.Session.FilePath);
+        var sku = gpus[0].Name;
+
+        // Cache wins; then the built-in per-SKU default (known cards mine
+        // optimally with NO sweep — no autotune wait). Only a truly unknown card
+        // falls through to the one-time sweep. The mine path's ApplyTunedProfile
+        // resolves the same way, so we don't need to seed the cache here.
+        if (TuneCache.Lookup(cachePath, sku) is { } hit)
+        {
+            log.LogInformation(
+                "autotune: cached profile for \"{Sku}\" — NB={Nb} MB={Mb} SEARCH_M={Sm} "
+                + "(run `arc-miner autotune` to re-tune)",
+                sku, hit.Nb, hit.Mb, hit.SearchM);
+            return;
+        }
+        if (SkuDefaultFor(sku) is { } baked)
+        {
+            log.LogInformation(
+                "autotune: built-in tuned default for \"{Sku}\" — {Cfg} (no sweep needed; "
+                + "run `arc-miner autotune` to re-tune for your exact card)",
+                sku, baked);
+            return;
+        }
+
+        log.LogInformation(
+            "autotune: no tuned profile for \"{Sku}\" yet — running a one-time autotune sweep before mining "
+            + "(cached for next launch; untuned A-series cards can be ~25× slower). Disable with --no-autotune.",
+            sku);
+        try { Run(args, lf, ct); }
+        catch (OperationCanceledException) { throw; }   // honour Ctrl-C / shutdown
+        catch (Exception e)
+        {
+            log.LogWarning("autotune: first-run sweep failed ({Err}) — mining with defaults", e.Message);
+        }
     }
 
     // ── adaptive search ──────────────────────────────────────────────────────

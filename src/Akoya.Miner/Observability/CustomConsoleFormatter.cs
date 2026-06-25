@@ -36,6 +36,35 @@ public sealed class CustomConsoleFormatter : ConsoleFormatter
         string message = logEntry.Formatter(logEntry.State, logEntry.Exception);
         if (string.IsNullOrEmpty(message) && logEntry.Exception == null) return;
 
+        // Short category (last dotted segment) — shared by both formats.
+        string category = logEntry.Category;
+        int dot = category.LastIndexOf('.');
+        if (dot >= 0 && dot < category.Length - 1) category = category[(dot + 1)..];
+
+        // When the live dashboard owns the screen, push a COMPACT line into its
+        // event ring: no emoji, a single level letter, and a short category, so
+        // the message itself gets the lion's share of the (clipped) row width.
+        if (Dashboard.Active)
+        {
+            var (col, ch) = logEntry.LogLevel switch
+            {
+                LogLevel.Trace       => (DarkGray,    'T'),
+                LogLevel.Debug       => (DarkGray,    'D'),
+                LogLevel.Information => (BrightCyan,   'I'),
+                LogLevel.Warning     => (BrightYellow, 'W'),
+                LogLevel.Error       => (BrightRed,    'E'),
+                LogLevel.Critical    => (BrightRed,    'C'),
+                _                    => (Reset,        '·'),
+            };
+            var c = new StringBuilder(64);
+            c.Append(DarkGray).Append(DateTime.Now.ToString("HH:mm:ss")).Append(' ').Append(Reset);
+            c.Append(col).Append(ch).Append(Reset).Append(' ');
+            c.Append(DarkGray).Append(category.Length > 14 ? category[..14] : category.PadRight(14)).Append(Reset).Append(' ');
+            if (!string.IsNullOrEmpty(message)) c.Append(HighlightMessage(message));
+            Dashboard.PushLog(c.ToString());
+            return;
+        }
+
         var sb = new StringBuilder();
 
         // 1. Timestamp
@@ -68,13 +97,7 @@ public sealed class CustomConsoleFormatter : ConsoleFormatter
                 break;
         }
 
-        // 3. Category (simplified)
-        string category = logEntry.Category;
-        int lastDot = category.LastIndexOf('.');
-        if (lastDot >= 0 && lastDot < category.Length - 1)
-        {
-            category = category[(lastDot + 1)..];
-        }
+        // 3. Category (simplified above)
         sb.Append(DarkGray).Append(category.PadRight(15)).Append(" ▏ ").Append(Reset);
 
         // 4. Message Body Highlighting

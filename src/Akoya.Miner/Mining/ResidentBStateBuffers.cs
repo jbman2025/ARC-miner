@@ -65,6 +65,13 @@ internal sealed class ResidentBStateBuffers : IDisposable
         BpEB      = AllocZero(bB);
         BScales   = AllocFp32Ones(N);
 
+#if SYCL_BACKEND
+        // SYCL noise_B self-allocates its per-block scratch and never dereferences
+        // the workspace param, so skip this allocation entirely (saves VRAM —
+        // ~the n*k Bt buffer). CUDA/ROCm noise_B DO use the workspace, so they
+        // keep the alloc below.
+        NoiseWorkspace = IntPtr.Zero;
+#else
         unsafe
         {
             nint ws = IntPtr.Zero;
@@ -79,6 +86,7 @@ internal sealed class ResidentBStateBuffers : IDisposable
                 stream: stream.Handle));
             NoiseWorkspace = ws;
         }
+#endif
     }
 
     public void Dispose()

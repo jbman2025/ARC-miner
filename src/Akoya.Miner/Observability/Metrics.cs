@@ -289,6 +289,52 @@ internal static class Metrics
         return new Snapshot(n, accepted, rejected, tmads, hashes, iters, tiles, expected);
     }
 
+    // ─── Live dashboard snapshot ───────────────────────────────────────────
+    // A single, allocation-light read of everything the in-place TUI dashboard
+    // renders, so the render loop touches the volatile fields exactly once per
+    // tick rather than calling a dozen accessors (each of which re-reads).
+    public readonly record struct DashGpu(
+        int Id, string Name, double HashesPerSec, double IterMs,
+        long Accepted, long Rejected, double HeartbeatAgeSec);
+
+    public readonly record struct DashSnapshot(
+        string PoolUrl, string Worker, bool Connected, double LatencyMs,
+        long Accepted, long Rejected, long BlockFinds,
+        double TotalHashesPerSec, string? PoolInfoJson, DashGpu[] Gpus);
+
+    public static DashSnapshot GetDashboardSnapshot()
+    {
+        var hashesArr = _hashesPerSec; var iterArr = _iterMs;
+        var accArr = _blocksAccepted; var rejArr = _blocksRejected;
+        var hbArr = _heartbeatTicks;  var names = _gpuNames;
+        int n = Math.Min(hashesArr.Length,
+                Math.Min(iterArr.Length, Math.Min(accArr.Length, rejArr.Length)));
+
+        long nowTicks = DateTime.UtcNow.Ticks;
+        var rows = new DashGpu[n];
+        double totalHs = 0;
+        long acc = 0, rej = 0;
+        for (int g = 0; g < n; g++)
+        {
+            double hs = BitConverter.Int64BitsToDouble(Volatile.Read(ref hashesArr[g]));
+            double ms = BitConverter.Int64BitsToDouble(Volatile.Read(ref iterArr[g]));
+            if (!double.IsFinite(hs)) hs = 0;
+            if (!double.IsFinite(ms)) ms = 0;
+            long a = Volatile.Read(ref accArr[g]);
+            long r = Volatile.Read(ref rejArr[g]);
+            long hb = hbArr.Length > g ? Interlocked.Read(ref hbArr[g]) : 0;
+            double hbAge = hb == 0 ? 0.0 : (nowTicks - hb) / (double)TimeSpan.TicksPerSecond;
+            string name = g < names.Length ? names[g] : $"GPU {g}";
+            rows[g] = new DashGpu(g, name, hs, ms, a, r, hbAge);
+            totalHs += hs; acc += a; rej += r;
+        }
+
+        return new DashSnapshot(
+            _poolUrl, _workerName, IsPoolConnected, GetPoolLatencyMs(),
+            acc, rej, Interlocked.Read(ref _blockFinds),
+            double.IsFinite(totalHs) ? totalHs : 0.0, _poolInfoJson, rows);
+    }
+
     private static void ServeLoop(ILogger log, CancellationToken ct)
     {
         var l = _listener!;
