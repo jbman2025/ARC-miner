@@ -44,6 +44,19 @@ public static partial class PearlGemmNative
     [LibraryImport(Lib, EntryPoint = "pearl_capi_get_required_scratchpad_bytes")]
     public static partial long GetRequiredScratchpadBytes(long matrixBytes, int threadsPerBlock);
 
+    [LibraryImport(Lib, EntryPoint = "pearl_capi_search_m")]
+    public static partial int SearchMNative(int m);
+
+    /// <summary>The search-M window the kernel actually sweeps (== native
+    /// compute_search_m). Used to size search-window-only device buffers (ApEA).
+    /// Falls back to <paramref name="m"/> (full size — always safe) if the loaded
+    /// lib predates the export.</summary>
+    public static int SearchM(int m)
+    {
+        try { return SearchMNative(m); }
+        catch (EntryPointNotFoundException) { return m; }
+    }
+
     // tensor_hash: data, key, out, roots are all device pointers.
     [LibraryImport(Lib, EntryPoint = "pearl_capi_tensor_hash")]
     public static partial int TensorHash(

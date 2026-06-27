@@ -13,9 +13,9 @@ All notable changes to ARC-miner are documented here. The format is based on
   of all of them — cutting ~97–99% of A's DRAM write/read traffic. The full A is
   transparently regenerated on the share-verification path, so proofs and shares
   are unaffected (validated byte-for-byte against the two-pass path and by live
-  pool accepts). Largest gain on A-series cards, where the full-A fill+hash
-  dominated each iteration; B580 also rises to **~37 TH/s** and idle VRAM drops to
-  **~5 GB**.
+  pool accepts). B580 rises to **~37 TH/s**; A-series sees a more modest gain (its
+  hash is BLAKE3-compute-bound rather than DRAM-bound, so removing the round-trip
+  saves less there). Idle VRAM also drops (see *Changed*).
 - **Built-in per-SKU tuned defaults.** Known cards (A380/A580/A750/A770, B570/B580)
   now mine at their characterized optimum with **no autotune wait** — the profile
   is baked in and applied on first run. Autotune only runs for a card we haven't
@@ -41,13 +41,18 @@ All notable changes to ARC-miner are documented here. The format is based on
 ### Changed
 - **Templated PoW inner loop.** The transcript-GEMM k-step is now instantiated
   with a compile-time rank (`R = 256`/`128`, dynamic fallback for other ranks),
-  letting the compiler fully unroll and pipeline the XMX/DPAS path. Output is
-  bit-identical and is dispatched on the runtime `noise_rank`, so every pool's
-  committed rank keeps working.
-- **Lower idle VRAM on Arc.** The resident B-state no longer allocates the
-  noise-B workspace on the SYCL backend — the Arc kernel self-allocates its
-  scratch and never read it — freeing headroom on 8 GB A-series cards. The
-  CUDA/ROCm backends keep the workspace.
+  letting the compiler fully unroll and pipeline the XMX/DPAS path. The full
+  unroll is applied on **Xe2 (`sg16`) only**; Xe-HPG (`sg8`, A-series) keeps the
+  dynamic loop, where the unroll would spill the smaller register file (~3× slower
+  tgemm on an A750). Output is bit-identical and is dispatched on the runtime
+  `noise_rank`, so every pool's committed rank keeps working.
+- **Lower idle VRAM on Arc.** Two reductions on the SYCL backend: the resident
+  B-state no longer allocates the noise-B workspace (the Arc kernel self-allocates
+  its scratch and never read it), and the per-iteration `ApEA` buffer is now sized
+  to the search window (`SEARCH_M` rows) instead of the full matrix — it only ever
+  held the searched rows. Together these cut **~1 GiB** (B580 idle VRAM ~5 → ~4 GB)
+  with no throughput change, freeing real headroom on 8 GB A-series cards. The
+  CUDA/ROCm backends keep the full-size buffers.
 - **Per-device XMX arch detection.** Sub-group selection (`sg8`/`sg16`) now
   queries each queue's device directly, so mixed-Arc rigs always dispatch the
   correct kernel.

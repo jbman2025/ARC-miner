@@ -116,7 +116,7 @@ PEARL_CAPI_EXPORT int pearl_capi_supports_sm(int major, int minor) {
 #elif defined(PEARL_GEMM_B200)
   return major == 10 && minor == 0;
 #elif defined(PEARL_GEMM_BLACKWELL)
-  return (major == 12) && (minor == 0 || minor == 1);   // 12.0 = 5090, 12.1 = GB10
+  return major == 12 && minor == 0;
 #elif defined(PEARL_GEMM_ADA)
   return major == 8 && minor == 9;
 #elif defined(PEARL_GEMM_AMPERE)
@@ -318,8 +318,6 @@ PEARL_CAPI_EXPORT int pearl_capi_noise_gen(int R,
       run_noise_generation<64, 64>(params, stream);
     } else if (R == 128) {
       run_noise_generation<128, 64>(params, stream);
-    } else if (R == 256) {
-      run_noise_generation<256, 64>(params, stream);   // GB10 / stratum mainnet (HeroMiners)
     } else {
       return -4;
     }

@@ -44,7 +44,7 @@ forever.**
 
 | GPU | Build | Hashrate |
 |---|---|---|
-| Arc **B580** | AOT `bmg-g31` | ~**37.2 TH/s** |
+| Arc **B580** | AOT `bmg-g21` | ~**34.8 TH/s** |
 | Arc **A750** | AOT `acm-g10` | ~**3.8 TH/s** |
 
 Numbers are very power-sensitive — confirm 100% GPU power before comparing.

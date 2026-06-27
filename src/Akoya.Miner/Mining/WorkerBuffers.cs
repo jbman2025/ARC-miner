@@ -104,6 +104,20 @@ internal sealed class WorkerBuffers : IDisposable
 #if !SYCL_BACKEND
         long bAxEBLFp16  = (long)M * R * 2;
 #endif
+        // ApEA only ever holds the SEARCH-window rows: add_i8 writes sm*k and the
+        // tgemm reads the sm×sn tile window — the full M*K alloc (512 MiB/half at
+        // canonical) is dead. On SYCL size it to the kernel's search-M, queried
+        // NATIVELY so it matches compute_search_m / the UCRT getenv the kernel
+        // reads (and can't drift if autotune sets SEARCH_M natively). The iter
+        // clamps sm to the workspace sm_cap (also compute_search_m(M)), so this is
+        // always ≥ what the kernel writes. CUDA/ROCm keep the full M*K buffer.
+#if SYCL_BACKEND
+        long smRows = PearlGemmNative.SearchM(M);
+        if (smRows <= 0 || smRows > M) smRows = M;   // defensive: fall back to full size
+        long bApEA = smRows * K;
+#else
+        long bApEA = bA;
+#endif
         long aLeafCvsBytes = ((bA + Blake3.ChunkLen - 1) / Blake3.ChunkLen) * Blake3.DigestSize;
         // Sized for the MOST rows a trigger header can open (256 u8 thread_rows
         // slots), NOT MiningConfiguration.DefaultRowsIndices. The H100 default
@@ -140,7 +154,7 @@ internal sealed class WorkerBuffers : IDisposable
 #else
         AxEBLFp16 = AllocZero(bAxEBLFp16);
 #endif
-        ApEA      = AllocZero(bA);
+        ApEA      = AllocZero(bApEA);
         AScales   = AllocFp32Ones(M);
         // The pure-miner CAPI path is headless and passes C=nullptr into the
         // transcript GEMM. Keeping this null avoids a dead M*N*bf16 allocation

@@ -21,12 +21,8 @@
 #include <sycl/sycl.hpp>
 #include <mutex>
 #include <chrono>
-#include <unordered_map>
 
 #define HQUEUE(s) static_cast<sycl::queue*>(s)
-
-static std::mutex g_seed_mutex;
-static std::unordered_map<sycl::queue*, uint64_t> g_last_base_seed;
 
 static inline int rc_sycl(const char* where) {
     fprintf(stderr, "[pearl_sycl] error in %s\n", where);
@@ -74,7 +70,6 @@ static int compute_search_m(int m) {
     return sm;
 }
 
-
 extern "C" {
 
 PEARL_EXPORT int pearl_capi_abi_version(void) { return 2; }
@@ -95,12 +90,6 @@ PEARL_EXPORT const char* pearl_capi_target_family(void) {
 #endif
 }
 PEARL_EXPORT int pearl_capi_supports_sm(int, int) { return 1; }
-// Search-M window the per-iter kernels actually sweep (== compute_search_m(m)).
-// Exposed so the C# host can size search-window-only device buffers (e.g. ApEA)
-// to the same value the kernel uses — reading the same UCRT getenv(AKOYA_SEARCH_M)
-// — so the host allocation can't diverge from the kernel even when autotune sets
-// SEARCH_M natively at runtime.
-PEARL_EXPORT int pearl_capi_search_m(int m) { return compute_search_m(m); }
 PEARL_EXPORT int pearl_capi_get_host_signal_sync_size(void) { return 8; }
 PEARL_EXPORT int pearl_capi_get_host_signal_header_size(void) { return 640; }
 PEARL_EXPORT int64_t pearl_capi_get_required_scratchpad_bytes(int64_t matrix_bytes, int) {
@@ -111,19 +100,7 @@ PEARL_EXPORT int64_t pearl_capi_get_required_scratchpad_bytes(int64_t matrix_byt
 PEARL_EXPORT int pearl_capi_lcg_int7_fill(void* dst, int64_t n,
                               uint64_t seed_lo, uint64_t seed_hi, void* stream) {
     try {
-        auto splitmix = [](uint64_t z) -> uint64_t {
-            z += 0x9E3779B97F4A7C15ULL;
-            z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
-            z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
-            return z ^ (z >> 31);
-        };
-        uint64_t base = splitmix(seed_lo ^ splitmix(seed_hi));
-        auto* q = HQUEUE(stream);
-        {
-            std::lock_guard<std::mutex> lock(g_seed_mutex);
-            g_last_base_seed[q] = base;
-        }
-        pk::launch_lcg_int7_fill(dst, n, base, q);
+        pk::launch_lcg_int7_fill(dst, n, seed_lo, seed_hi, HQUEUE(stream));
         return 0;
     } catch (...) { return rc_sycl("lcg_int7_fill"); }
 }
@@ -136,22 +113,8 @@ PEARL_EXPORT int pearl_capi_tensor_hash(const uint8_t* data, uint32_t data_size,
                             const uint8_t* key, uint32_t, uint32_t, uint32_t, uint32_t,
                             uint8_t* roots, int, void* stream) {
     try {
-        auto* q = HQUEUE(stream);
-        uint64_t base = 0;
-        bool has_base = false;
-        {
-            std::lock_guard<std::mutex> lock(g_seed_mutex);
-            auto it = g_last_base_seed.find(q);
-            if (it != g_last_base_seed.end()) {
-                base = it->second;
-                has_base = true;
-            }
-        }
-        if (has_base) {
-            pk::launch_lcg_int7_fill(const_cast<uint8_t*>(data), (int64_t)data_size, base, q);
-        }
         pk::parallel_tensor_hash(data, (long)data_size, (const u32*)key,
-                                 (u32*)roots, out, q);
+                                 (u32*)roots, out, HQUEUE(stream));
         return 0;
     } catch (...) { return rc_sycl("tensor_hash"); }
 }
@@ -160,22 +123,8 @@ PEARL_EXPORT int pearl_capi_tensor_hash_leaf_cvs(const uint8_t* d, uint32_t s, u
                                      const uint8_t* k, uint32_t, uint32_t, uint32_t, uint32_t,
                                      uint8_t* r, uint8_t* leaf_cvs, int, void* st) {
     try {
-        auto* q = HQUEUE(st);
-        uint64_t base = 0;
-        bool has_base = false;
-        {
-            std::lock_guard<std::mutex> lock(g_seed_mutex);
-            auto it = g_last_base_seed.find(q);
-            if (it != g_last_base_seed.end()) {
-                base = it->second;
-                has_base = true;
-            }
-        }
-        if (has_base) {
-            pk::launch_lcg_int7_fill(const_cast<uint8_t*>(d), (int64_t)s, base, q);
-        }
         pk::parallel_tensor_hash(d, (long)s, (const u32*)k, (u32*)r, o,
-                                 q, leaf_cvs);
+                                 HQUEUE(st), leaf_cvs);
         return 0;
     } catch (...) { return rc_sycl("tensor_hash_leaf_cvs"); }
 }
@@ -305,22 +254,27 @@ PEARL_EXPORT int pearl_capi_iter(void* ws, uint64_t seed_lo,
     auto lap = [&](int i){ if (g_prof){ q->wait();
         acc[i] += std::chrono::duration<double,std::milli>(clk::now()-t0).count(); t0 = clk::now(); } };
 
-    // 1 & 2. Fused LCG and Tensor Hash
-    auto splitmix = [](uint64_t z) -> uint64_t {
-        z += 0x9E3779B97F4A7C15ULL;
-        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
-        z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
-        return z ^ (z >> 31);
-    };
-    uint64_t base = splitmix(seed_lo ^ splitmix(p.sigma_seed));
-    {
-        std::lock_guard<std::mutex> lock(g_seed_mutex);
-        g_last_base_seed[q] = base;
+    // 1+2. Fused LCG-fill + AHash = tensor_hash(A) (Gemini fixs2 #1, searched-rows).
+    // Hashes ALL m rows (AHash bit-identical — validated byte-for-byte vs the
+    // two-pass path in fused_check.cpp) but writes int8 A to DRAM only for the sm
+    // search rows. Full A is restored on the trigger path (GpuWorker regenerates
+    // it via lcg_int7_fill before share verification). Kill-switch: set
+    // AKOYA_NO_FUSED_HASH=1 to fall back to the original two-pass.
+    static const bool s_noFused = []{ const char* v = getenv("AKOYA_NO_FUSED_HASH"); return v && v[0]=='1'; }();
+    if (s_noFused) {
+        pearl_capi_lcg_int7_fill(p.A, (int64_t)m * k, seed_lo, p.sigma_seed, stream);
+        lap(0);
+        pk::parallel_tensor_hash((const uint8_t*)p.A, (long)m * k, (const u32*)p.Key,
+                                 (u32*)p.Roots, (uint8_t*)p.AHash, q);
+        lap(1);
+    } else {
+        pk::parallel_tensor_hash_fused((uint8_t*)p.A, (long)m * k, (long)sm * k,
+                                       seed_lo, p.sigma_seed,
+                                       (const u32*)p.Key, (u32*)p.Roots,
+                                       (uint8_t*)p.AHash, q);
+        lap(0);
+        lap(1);
     }
-    pk::parallel_tensor_hash_fused((uint8_t*)p.A, (long)m * k, (const u32*)p.Key,
-                                   (u32*)p.Roots, (uint8_t*)p.AHash, q, base, (long)sm * k);
-    lap(0);
-    lap(1);
 
     // 3. commitment
     pk::launch_commitment_hash((const uint8_t*)p.AHash, (const uint8_t*)p.BHash,
@@ -345,8 +299,8 @@ PEARL_EXPORT int pearl_capi_iter(void* ws, uint64_t seed_lo,
                       sm * k, q);
     lap(5);
 
-    // 6b. Transpose BpEB[n,k] → Bt[k,n] once per Iter (BpEB is constant across the
-    //     thousands of iters in a Iter period). The XMX tgemm then loads B with a
+    // 6b. Transpose BpEB[n,k] → Bt[k,n] once per σ (BpEB is constant across the
+    //     thousands of iters in a σ period). The XMX tgemm then loads B with a
     //     fast row-major layout instead of a strided col-major load.
     if (!w->bt_valid) {
         pk::launch_transpose_i8((const int8_t*)p.BpEB, w->Bt, n, k, q);
