@@ -80,4 +80,23 @@ internal static class ReconnectBackoff
     /// Used by the caller to emit a warning log.</summary>
     public static bool HintWasClamped(double hintSeconds) =>
         hintSeconds > MaxReconnectHintSeconds;
+
+    /// <summary>A jitter sample in [-1.0, +1.0] from the shared RNG.</summary>
+    private static double RandomJitter() => (Random.Shared.NextDouble() * 2) - 1;
+
+    /// <summary>
+    /// Production entry point: <see cref="ComputeDelay"/> with real jitter.
+    ///
+    /// Every algo's reconnect loop used to inline
+    /// <c>Math.Min(60, Math.Pow(2, Math.Min(attempt, 6)))</c>, which is the same
+    /// exponential and cap but with **no jitter** — so a pool restart made every
+    /// worker in a fleet retry on the same second, repeatedly, which is exactly
+    /// the thundering herd the jitter exists to prevent. It also had no floor,
+    /// so attempt 0 (never produced today, but one refactor away) meant a 1s
+    /// hot loop.
+    /// </summary>
+    public static TimeSpan NextDelay(int attempt) => ComputeDelay(attempt, RandomJitter());
+
+    /// <summary>Production entry point for <see cref="ApplyHint"/>.</summary>
+    public static TimeSpan? NextHintDelay(double hintSeconds) => ApplyHint(hintSeconds, RandomJitter());
 }

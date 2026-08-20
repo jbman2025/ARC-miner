@@ -1,0 +1,68 @@
+# .NET
+bin/
+obj/
+.vs/
+*.user
+
+# build.sh / build.ps1 ready-to-run output. The Linux binary is an ELF with NO
+# extension, so the *.exe / *.so rules below do not catch it — match the folders.
+out/
+out-linux*/
+out-btx-linux*/
+
+# Rust
+target/
+
+# CUDA / native build outputs
+**/build/
+*.o
+*.so
+
+# Windows native build outputs (build.ps1 / CMake)
+**/build-win/
+*.obj
+*.dll
+*.lib
+*.exp
+*.pdb
+
+# ── Public-release exclusions (added 2026-06-16) ───────────────
+# Prebuilt binaries, archives, and backups — this is a SOURCE release.
+*.exe
+*.so.*
+*.dylib
+*.zip
+*.7z
+*.tar
+*.tar.gz
+*.bak
+*.bak-*
+*.bak*
+
+# Prebuilt / staged packages & per-die test folders (local only)
+/a750 test/
+/b580 gold/
+/b70 test/
+/a750-package/
+/kryptex-package/
+/stratum-package/
+
+# Personal / internal notes — never publish
+.claude/
+message.txt
+reply-draft.md
+pool compatibility.txt
+A1start.bat
+A2start-alphapool.bat
+A1-start-*.bat
+A1-start-*.sh
+
+# Local scratch: one-off probes, their compiled binaries, and runtime logs.
+scratchpad/
+logs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+

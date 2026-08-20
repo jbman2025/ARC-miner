@@ -39,6 +39,14 @@ public sealed class StratumSession : IPoolSession
     private byte[] _extranonce1 = [];
     private readonly List<string> _jobHistory = new();
     private readonly Dictionary<string, string> _sigmaToJobId = new();
+    // Insertion-order companion to _sigmaToJobId so eviction removes the
+    // ACTUAL oldest entry. The previous `foreach(Keys){Remove;break}` relied
+    // on Dictionary enumeration order == insertion order, which breaks after
+    // the first Remove (freed slots are reused LIFO): from entry #101 on,
+    // every NEW mapping was inserted and immediately evicted, so submits fell
+    // back to a σ-prefix pseudo job id (constant "00004020…") that every pool
+    // rejects — the "reject storm at exactly ~45 min (≈100 jobs)" bug.
+    private readonly Queue<string> _sigmaJobOrder = new();
     private int _requestId = 1;
 
     // Lines received before the read loop starts (the pearl/v1 handshake can
@@ -58,6 +66,7 @@ public sealed class StratumSession : IPoolSession
     // positional submit params ([worker, job_id, plain_proof_b64]) instead of
     // the Pearl-stratum object form.
     private volatile bool _pearlV1;
+    private bool _gzipEnabled;
 
     // Monotonic TickCount64 of the last inbound line. Volatile-written from the
     // read loop, Volatile-read from the idle watchdog. Drives reconnect when a
@@ -76,12 +85,12 @@ public sealed class StratumSession : IPoolSession
     // break a pool that strictly validates configure params, so the safe
     // transports (.well-known + inbound pool.info) work without touching it.
     private static readonly bool s_poolInfoNegotiate =
-        Akoya.Crypto.MinerEnv.Get("AKOYA_POOL_INFO_NEGOTIATE") == "1";
+        Akoya.Crypto.MinerEnv.Get("ARC_POOL_INFO_NEGOTIATE") == "1";
 
     // ON by default (kill-switch =0): fetch the pool's .well-known fee file once
     // at stream start. Separate connection, bounded, never blocks mining.
     private static readonly bool s_poolInfoWellKnown =
-        Akoya.Crypto.MinerEnv.Get("AKOYA_POOL_INFO_WELLKNOWN") != "0";
+        Akoya.Crypto.MinerEnv.Get("ARC_POOL_INFO_WELLKNOWN") != "0";
 
     // Shared, bounded HTTP client for the .well-known fetch only.
     private static readonly System.Net.Http.HttpClient s_http =
@@ -104,14 +113,14 @@ public sealed class StratumSession : IPoolSession
         _workerName = identity.WorkerName;
         _agent = "ARC-miner/" + identity.MinerVersion;
 
-        // Seed the difficulty prior from the requested d= (AKOYA_STRATUM_DIFF /
+        // Seed the difficulty prior from the requested d= (ARC_STRATUM_DIFF /
         // --diff) so that if a pool sends mining.notify BEFORE its first
         // set_difficulty, ParseArrayNotify synthesizes the target from the diff
         // we ASKED for instead of the trivially-easy challenge floor (32). Mining
         // a job at diff 32 against a pool whose real target is far higher yields
         // immediate "below_target" rejects (reason 20). The pool's own
         // set_difficulty still overwrites this the moment it arrives.
-        var reqDiff = Akoya.Crypto.MinerEnv.Get("AKOYA_STRATUM_DIFF");
+        var reqDiff = Akoya.Crypto.MinerEnv.Get("ARC_STRATUM_DIFF");
         if (long.TryParse(reqDiff, out var rd) && rd > 0)
             Volatile.Write(ref _lastDifficulty, rd);
 
@@ -195,7 +204,7 @@ public sealed class StratumSession : IPoolSession
         // anything else is accepted. "Pool speaks first with a challenge" is
         // the detection — no configuration needed. Pools that wait for the
         // client (Akoya Pearl-stratum) simply time the window out (~1.5 s,
-        // AKOYA_CHALLENGE_WAIT_MS) and take the legacy path below.
+        // ARC_CHALLENGE_WAIT_MS) and take the legacy path below.
         var firstLine = await TryReadEarlyLineAsync(ct).ConfigureAwait(false);
         if (firstLine is not null)
         {
@@ -219,7 +228,8 @@ public sealed class StratumSession : IPoolSession
             {
                 Wallet = _walletAddress,
                 Worker = _workerName,
-                Agent = _agent
+                Agent = _agent,
+                Type = "v2"
             }
         };
         var authReqJson = JsonSerializer.Serialize(authReq, StratumJsonContext.Default.StratumAuthorizeRequest);
@@ -248,6 +258,11 @@ public sealed class StratumSession : IPoolSession
             if (msg.Method is null && msg.Id == authId)
             {
                 authMsg = msg;
+                if (msg.Type == "v2")
+                {
+                    _gzipEnabled = true;
+                    _log.LogInformation("stratum: negotiated Gzip (v2) compression protocol");
+                }
                 break;
             }
             // notify / set_difficulty / other notification ahead of the auth
@@ -280,7 +295,7 @@ public sealed class StratumSession : IPoolSession
 
     private async Task<string?> TryReadEarlyLineAsync(CancellationToken ct)
     {
-        int waitMs = int.TryParse(Akoya.Crypto.MinerEnv.Get("AKOYA_CHALLENGE_WAIT_MS"), out var w) && w >= 0
+        int waitMs = int.TryParse(Akoya.Crypto.MinerEnv.Get("ARC_CHALLENGE_WAIT_MS"), out var w) && w >= 0
             ? w : 1500;
         if (waitMs == 0) return null;
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -308,7 +323,7 @@ public sealed class StratumSession : IPoolSession
     }
 
     private static int MaxChallengeDifficulty =>
-        int.TryParse(Akoya.Crypto.MinerEnv.Get("AKOYA_CHALLENGE_MAX_DIFF"), out var d) && d > 0
+        int.TryParse(Akoya.Crypto.MinerEnv.Get("ARC_CHALLENGE_MAX_DIFF"), out var d) && d > 0
             ? d : 40;   // 2^40 ≈ minutes-to-hours on CPU; anything above is hostile/buggy
 
     /// <summary>Solve a challenge and send the response. Returns the request
@@ -352,7 +367,7 @@ public sealed class StratumSession : IPoolSession
 
         int cfgId = _requestId++;
         // Default capability list is unchanged ([\"pearl/v1\"]). Only when the
-        // operator opts in (AKOYA_POOL_INFO_NEGOTIATE=1) do we add the
+        // operator opts in (ARC_POOL_INFO_NEGOTIATE=1) do we add the
         // pool-info/v1 token — see s_poolInfoNegotiate.
         string cfgCaps = s_poolInfoNegotiate ? "[\"pearl/v1\",\"pool-info/v1\"]" : "[\"pearl/v1\"]";
         await WriteLineAsync($"{{\"id\":{cfgId},\"method\":\"mining.configure\",\"params\":[{cfgCaps},{{}}]}}", ct)
@@ -381,7 +396,20 @@ public sealed class StratumSession : IPoolSession
                     throw new InvalidOperationException("stratum: pool rejected the challenge response");
                 continue;
             }
-            if (msg.Method is null && (msg.Id == cfgId || msg.Id == subId)) continue;
+            if (msg.Method is null && msg.Id == cfgId) continue;
+            if (msg.Method is null && msg.Id == subId)
+            {
+                if (msg.Result is { ValueKind: JsonValueKind.Array } resArr && resArr.GetArrayLength() >= 2)
+                {
+                    var extra1Hex = resArr[1].GetString();
+                    if (!string.IsNullOrEmpty(extra1Hex))
+                    {
+                        _extranonce1 = HexToBytes(extra1Hex);
+                        _log.LogInformation("stratum: parsed extranonce1: {Hex}", extra1Hex);
+                    }
+                }
+                continue;
+            }
             if (msg.Method is null && msg.Id == authId)
             {
                 if (msg.Error is { ValueKind: not JsonValueKind.Null } err)
@@ -411,26 +439,70 @@ public sealed class StratumSession : IPoolSession
             _log.LogWarning("stratum: array-form notify with {N} params — ignoring", arr.GetArrayLength());
             return null;
         }
-        double diff = Volatile.Read(ref _lastDifficulty);
-        if (diff <= 0)
+
+        if (arr.GetArrayLength() >= 9)
         {
-            // Reached only when the pool sent neither a set_difficulty NOR was a
-            // d= requested (--diff). diff=32 is the challenge floor and is almost
-            // certainly far below the pool's real share target → shares will be
-            // rejected "below_target". Tell the operator how to fix it.
-            _log.LogWarning(
-                "stratum: notify before any set_difficulty and no --diff requested — "
-                + "assuming diff=32; shares will likely be rejected below_target. "
-                + "Pass --diff <n> (e.g. AlphaPool --diff 250000) to set the share difficulty.");
-            diff = 32;
+            try
+            {
+                byte[] extranonce2 = new byte[4];
+                var jobAssignment = StratumJobParser.ParseNotification(arr, _extranonce1, extranonce2);
+                string headerHex = Convert.ToHexString(jobAssignment.Sigma.Span).ToLowerInvariant();
+                string jobIdStr = arr[0].GetString() ?? "";
+
+                lock (_sigmaToJobId)
+                {
+                    if (!_sigmaToJobId.ContainsKey(headerHex))
+                        _sigmaJobOrder.Enqueue(headerHex);
+                    _sigmaToJobId[headerHex] = jobIdStr;
+                    while (_sigmaToJobId.Count > 100 && _sigmaJobOrder.TryDequeue(out var oldest))
+                        _sigmaToJobId.Remove(oldest);
+                }
+
+                double diff = Volatile.Read(ref _lastDifficulty);
+                if (diff <= 0) diff = 32;
+
+                string bSeedHex = Convert.ToHexString(jobAssignment.BSeed.Span);
+                uint auditK = jobAssignment.AuditK;
+
+                _log.LogInformation("stratum: reconstructed positional notify sigma={SigmaHex} height={H} b_seed={BSeedHex} audit_k={AuditK}",
+                    headerHex[..Math.Min(16, headerHex.Length)], jobAssignment.BlockHeight,
+                    bSeedHex[..Math.Min(8, bSeedHex.Length)], auditK);
+
+                return new StratumNotifyParams
+                {
+                    JobId = jobIdStr,
+                    Header = headerHex,
+                    Height = jobAssignment.BlockHeight,
+                    Target = NbitsToTargetHex(DifficultyToNbits(diff)),
+                    BSeed = bSeedHex,
+                    AuditK = auditK
+                };
+            }
+            catch (Exception ex)
+            {
+                _log.LogError(ex, "stratum: failed to parse standard stratum notify array");
+                return null;
+            }
         }
-        return new StratumNotifyParams
+        else
         {
-            JobId  = arr[0].GetString() ?? "",
-            Header = arr[2].GetString() ?? "",
-            Height = arr[3].ValueKind == JsonValueKind.Number ? arr[3].GetInt64() : 0,
-            Target = NbitsToTargetHex(DifficultyToNbits(diff)),
-        };
+            double diff = Volatile.Read(ref _lastDifficulty);
+            if (diff <= 0)
+            {
+                _log.LogWarning(
+                    "stratum: notify before any set_difficulty and no --diff requested — "
+                    + "assuming diff=32; shares will likely be rejected below_target. "
+                    + "Pass --diff <n> (e.g. AlphaPool --diff 250000) to set the share difficulty.");
+                diff = 32;
+            }
+            return new StratumNotifyParams
+            {
+                JobId  = arr[0].GetString() ?? "",
+                Header = arr[2].GetString() ?? "",
+                Height = arr[3].ValueKind == JsonValueKind.Number ? arr[3].GetInt64() : 0,
+                Target = NbitsToTargetHex(DifficultyToNbits(diff)),
+            };
+        }
     }
 
     /// <summary>Expand compact nbits to the 32-byte big-endian target, hex
@@ -451,8 +523,8 @@ public sealed class StratumSession : IPoolSession
 
     private static string BuildStratumPassword()
     {
-        string pw = Akoya.Crypto.MinerEnv.Get("AKOYA_STRATUM_PASSWORD") ?? "x";
-        var dEnv = Akoya.Crypto.MinerEnv.Get("AKOYA_STRATUM_DIFF");
+        string pw = Akoya.Crypto.MinerEnv.Get("ARC_STRATUM_PASSWORD") ?? "x";
+        var dEnv = Akoya.Crypto.MinerEnv.Get("ARC_STRATUM_DIFF");
         if (long.TryParse(dEnv, out var d) && d > 0 && !pw.Contains("d=", StringComparison.OrdinalIgnoreCase))
             pw += $";d={d}";
         return pw;
@@ -463,7 +535,7 @@ public sealed class StratumSession : IPoolSession
     /// <summary>Pool-TLS certificate policy. Pool TLS provides encryption-in-
     /// transit, not server identity — pools serve self-signed / name-mismatched
     /// certs — so we accept by default (like xmrig and prl-proxy) rather than
-    /// requiring a CA chain. If AKOYA_POOL_TLS_FINGERPRINT is set, the cert's
+    /// requiring a CA chain. If ARC_POOL_TLS_FINGERPRINT is set, the cert's
     /// SHA-256 must match it (trust-on-first-use style pinning); otherwise we
     /// accept and log the fingerprint so an operator can pin it later.
     /// <c>--tls-insecure</c> forces accept-anything (ignores the pin).</summary>
@@ -473,7 +545,7 @@ public sealed class StratumSession : IPoolSession
         if (cert is null) return true;        // anonymous cipher — nothing to pin
 
         string fp = Convert.ToHexString(SHA256.HashData(cert.GetRawCertData())).ToLowerInvariant();
-        string? pin = Akoya.Crypto.MinerEnv.Get("AKOYA_POOL_TLS_FINGERPRINT")
+        string? pin = Akoya.Crypto.MinerEnv.Get("ARC_POOL_TLS_FINGERPRINT")
             ?.Replace(":", "").Replace(" ", "").ToLowerInvariant();
 
         if (!string.IsNullOrEmpty(pin) && pin != fp)
@@ -563,11 +635,11 @@ public sealed class StratumSession : IPoolSession
     /// which every Pearl-stratum pool accepts (it just re-confirms the worker).
     ///
     /// OPT-IN: disabled by default. Enable with the --keepalive CLI flag or by
-    /// setting AKOYA_STRATUM_KEEPALIVE_SEC to a positive interval (seconds).</summary>
+    /// setting ARC_STRATUM_KEEPALIVE_SEC to a positive interval (seconds).</summary>
     private async Task KeepAliveLoop(CancellationToken ct)
     {
         var sec = 0;   // off unless explicitly enabled
-        var raw = Akoya.Crypto.MinerEnv.Get("AKOYA_STRATUM_KEEPALIVE_SEC");
+        var raw = Akoya.Crypto.MinerEnv.Get("ARC_STRATUM_KEEPALIVE_SEC");
         if (!string.IsNullOrEmpty(raw) && int.TryParse(raw, out var parsed)) sec = parsed;
         if (sec <= 0) return;
 
@@ -614,17 +686,27 @@ public sealed class StratumSession : IPoolSession
 
         var sigmaHex = Convert.ToHexString(share.Sigma.Span).ToLowerInvariant();
         string jobId;
+        bool jobIdMissed;
         lock (_sigmaToJobId)
         {
-            if (!_sigmaToJobId.TryGetValue(sigmaHex, out var foundJobId))
+            jobIdMissed = !_sigmaToJobId.TryGetValue(sigmaHex, out var foundJobId);
+            if (jobIdMissed)
             {
                 foundJobId = Convert.ToHexString(share.Sigma.Span.Slice(0, 16)).ToLowerInvariant();
             }
-            jobId = foundJobId;
+            jobId = foundJobId!;
         }
+        if (jobIdMissed)
+            _log.LogWarning(
+                "stratum: no job id recorded for this share's σ — submitting with σ-prefix fallback ({JobIdPrefix}); pool will likely reject",
+                jobId[..Math.Min(8, jobId.Length)]);
 
         // Serialize ShareSubmission to Bincode byte array and base64 encode it as the plain_proof
         var serializedBytes = BincodeSerializer.Serialize(share);
+        if (_gzipEnabled)
+        {
+            serializedBytes = CompressGzip(serializedBytes);
+        }
         var plainProofBase64 = Convert.ToBase64String(serializedBytes);
 
         int reqId = _requestId++;
@@ -651,6 +733,16 @@ public sealed class StratumSession : IPoolSession
         }
         _log.LogInformation("stratum: submitting share (job={JobIdPrefix})", jobId[..Math.Min(8, jobId.Length)]);
         await WriteLineAsync(json, ct).ConfigureAwait(false);
+    }
+
+    private static byte[] CompressGzip(byte[] data)
+    {
+        using var ms = new MemoryStream();
+        using (var gzip = new System.IO.Compression.GZipStream(ms, System.IO.Compression.CompressionMode.Compress, true))
+        {
+            gzip.Write(data, 0, data.Length);
+        }
+        return ms.ToArray();
     }
 
     private async Task ReadLoopAsync(CancellationToken ct)
@@ -811,17 +903,7 @@ public sealed class StratumSession : IPoolSession
         await _stream.FlushAsync(ct).ConfigureAwait(false);
     }
 
-    private static byte[] HexToBytes(string hex)
-    {
-        if (string.IsNullOrEmpty(hex)) return [];
-        if (hex.Length % 2 != 0) hex = "0" + hex;
-        byte[] bytes = new byte[hex.Length / 2];
-        for (int i = 0; i < bytes.Length; i++)
-        {
-            bytes[i] = byte.Parse(hex.AsSpan(i * 2, 2), System.Globalization.NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture);
-        }
-        return bytes;
-    }
+    private static byte[] HexToBytes(string hex) => Akoya.Crypto.Hex.Decode(hex);
 
     private JobAssignment ParsePearlNotification(StratumNotifyParams p)
     {
@@ -830,15 +912,11 @@ public sealed class StratumSession : IPoolSession
         string headerHex = p.Header.ToLowerInvariant();
         lock (_sigmaToJobId)
         {
+            if (!_sigmaToJobId.ContainsKey(headerHex))
+                _sigmaJobOrder.Enqueue(headerHex);
             _sigmaToJobId[headerHex] = p.JobId;
-            if (_sigmaToJobId.Count > 100)
-            {
-                foreach (var key in _sigmaToJobId.Keys)
-                {
-                    _sigmaToJobId.Remove(key);
-                    break;
-                }
-            }
+            while (_sigmaToJobId.Count > 100 && _sigmaJobOrder.TryDequeue(out var oldest))
+                _sigmaToJobId.Remove(oldest);
         }
 
         byte[] jobIdBytes = new byte[16];
@@ -855,13 +933,17 @@ public sealed class StratumSession : IPoolSession
 
         byte[] targetBytes = HexToBytes(p.Target);
         uint targetNbits = TargetToNbits(targetBytes);
-        if (Akoya.Crypto.MinerEnv.Get("AKOYA_FAKE_TARGET") == "1")
+        if (Akoya.Crypto.MinerEnv.Get("ARC_FAKE_TARGET") == "1")
         {
             targetNbits = 0x207fffff;
         }
 
         byte[] bSeed = new byte[32];
-        uint auditK = 0;
+        if (!string.IsNullOrEmpty(p.BSeed))
+        {
+            bSeed = HexToBytes(p.BSeed);
+        }
+        uint auditK = p.AuditK ?? 0;
 
         return new JobAssignment
         {

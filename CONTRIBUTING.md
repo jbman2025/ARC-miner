@@ -19,7 +19,7 @@ the same license.
 - **Don't regress the hot path.** The mining loop and kernel are performance- and
   correctness-critical. If you touch share construction, the target comparison,
   or the kernel, validate that real shares are still **pool-accepted** (not just
-  that it builds). The `AKOYA_SHARE_TRACE=1` diagnostic dumps a submitted share's
+  that it builds). The `ARC_SHARE_TRACE=1` diagnostic dumps a submitted share's
   difficulty math, which is handy for this.
 - **No fees, no telemetry.** ARC-miner takes a 0% dev fee and phones home to
   nothing. PRs that add either will be declined.

@@ -9,4 +9,7 @@
     <Project Path="src/Akoya.Pool/Akoya.Pool.csproj" />
     <Project Path="src/Akoya.Proto/Akoya.Proto.csproj" />
   </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Akoya.Miner.Tests/Akoya.Miner.Tests.csproj" />
+  </Folder>
 </Solution>

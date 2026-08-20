@@ -18,12 +18,45 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <cstdio>
 
 #define HSYCL(s) static_cast<sycl::queue*>(s)
 
 namespace pk {
 
 namespace xmx = sycl::ext::oneapi::experimental::matrix;
+
+// ── Tuning-knob environment lookup ──────────────────────────────────────────
+// HOST-SIDE ONLY (called from the launch_* functions, never from device code).
+//
+// Reads a tuning knob under BOTH spellings: `ARC_<name>` is canonical — it is
+// what autotune prints as its "apply this" advice, what arc-tune.conf feeds
+// through WorkerOrchestrator.ApplyTunedProfile, what NativeEnv.Set pushes into
+// the UCRT at runtime, and what GpuWorker's throughput mirror reads.
+// `AKOYA_<name>` is a legacy alias, tried second.
+//
+// WHY: the kernel used to read ONLY `AKOYA_*` while the entire C# host set ONLY
+// `ARC_*`, so NO tuning knob ever reached the kernel — every autotune config
+// silently ran the same per-arch defaults. Worse, GpuWorker derives TMADs/s from
+// the *requested* ARC_SEARCH_M while the kernel kept sweeping its 4096 default,
+// so reported throughput inflated by SEARCH_M/4096 (an observed 299.7 TMADs/s on
+// a B580 whose real figure is ~35.9 — an 8x overcount at SEARCH_M=32768) and
+// autotune's SEARCH_M climb always "won" at the top ladder rung because a bigger
+// requested window raised the reported number without changing the real work.
+//
+// An empty value ("ARC_SEARCH_M=", e.g. left by a shell that "unsets" by
+// assigning blank) does NOT count as set: it falls through to the alias and then
+// to `def`, rather than clamping the search window to 16 while the host still
+// reports full-window hashrate.
+inline int tune_env_int(const char* name, int def) {
+    for (const char* prefix : { "ARC_", "AKOYA_" }) {
+        char buf[64];
+        std::snprintf(buf, sizeof buf, "%s%s", prefix, name);
+        const char* v = getenv(buf);
+        if (v && atoi(v) > 0) return atoi(v);
+    }
+    return def;
+}
 
 // ── XMX sub-group / tile-shape selection ────────────────────────────────────
 // Intel XMX int8 joint_matrix shapes are GENERATION-SPECIFIC:
@@ -53,6 +86,44 @@ inline bool is_xe_hpg(sycl::queue* q) {
     } catch (...) {
         return false;   // unknown arch → keep the historical sg16 behaviour
     }
+}
+
+// ── Fat multi-arch AOT: per-target-image XMX body elision ────────────────────
+// A single AOT invocation for BOTH generations
+//   -fsycl-targets=intel_gpu_acm_g10,intel_gpu_bmg_g31  (+ -DPEARL_FAT_AOT)
+// codegens EVERY submitted kernel for EVERY target image, so the sg16 DPAS
+// kernel would be gen-compiled for the acm image (and sg8 for bmg) → the
+// offline gen compiler ABORTS on the foreign generation's DPAS shapes (the
+// same abort the single-arch -DPEARL_XMX_ONLY_SG{8,16} pins avoid by dropping
+// one variant entirely). `if_architecture_is` lowers to
+// `if constexpr(device_architecture_is<Archs...>())`, a per-target-image
+// compile-time constant, so the non-matching body is a DISCARDED statement —
+// never ODR-used, never codegen'd for that image. One fat pearl_gemm_capi.dll
+// then carries both generations' AOT-optimized kernels; is_xe_hpg() picks the
+// matching one to LAUNCH at runtime (the two mechanisms cooperate). Validated
+// 2026-07-03 via scratchpad/arch_probe.cpp: guarded builds acm+bmg in one
+// invocation (exit 0); unguarded reproduces the gen-compiler abort.
+//
+// if_architecture_is is AOT-only (it static_asserts on -fsycl-targets), so the
+// guard is compiled in ONLY for the fat build. JIT (foreign DPAS is never
+// codegen'd — a kernel only lowers when launched) and single-arch AOT (one
+// variant instantiated) call the body directly → byte-identical to the
+// historical path, zero behaviour change on the existing per-die builds.
+template<int SG, class F>
+inline void xmx_arch_guard(F f) {
+#if defined(PEARL_FAT_AOT)
+    namespace sex = sycl::ext::oneapi::experimental;
+    if constexpr (SG == 8) {
+        sex::if_architecture_is<sex::architecture::intel_gpu_acm_g10,
+                                sex::architecture::intel_gpu_acm_g11,
+                                sex::architecture::intel_gpu_acm_g12>(f);
+    } else {
+        sex::if_architecture_is<sex::architecture::intel_gpu_bmg_g21,
+                                sex::architecture::intel_gpu_bmg_g31>(f);
+    }
+#else
+    f();
+#endif
 }
 
 // ── Unique kernel name tags (required by SYCL) ──────────────────────────────
@@ -186,7 +257,8 @@ inline void parallel_tensor_hash(const uint8_t* data, long len, const u32* key,
 
 inline void parallel_tensor_hash_fused(uint8_t* data, long len, const u32* key,
                                         u32* scratch, uint8_t* out,
-                                        sycl::queue* q, uint64_t base, long write_limit) {
+                                        sycl::queue* q, uint64_t base, long write_limit,
+                                        uint8_t* leaf_cvs = nullptr) {
     long nchunks = (len + 1023) / 1024; if (nchunks < 1) nchunks = 1;
     u32* bufA = scratch;
     u32* bufB = scratch + nchunks * 8;
@@ -256,6 +328,11 @@ inline void parallel_tensor_hash_fused(uint8_t* data, long len, const u32* key,
             for (int j = 0; j < 8; ++j) bufA[i * 8 + j] = cv[j];
         });
 
+    // Export per-chunk leaf CVs (bit-identical to the two-pass tensor_hash leaf
+    // CVs — the merkle-proof path consumes these). Must copy before the reduction
+    // overwrites bufA.
+    if (leaf_cvs) q->memcpy(leaf_cvs, bufA, (size_t)nchunks * 32);
+
     if (nchunks == 1) {
         q->memcpy(out, bufA, 32);
         return;
@@ -284,16 +361,71 @@ inline void parallel_tensor_hash_fused(uint8_t* data, long len, const u32* key,
 }
 
 // ── commitment_hash ────────────────────────────────────────────────────────
+// Derives the two noise seeds from the Merkle roots. This is consensus code:
+// the seeds decide the noise the GEMM searches over, so a single wrong byte
+// makes every share invalid (and, worse, still LOOK like it is mining).
+//
+// `salted` selects the certificate version's derivation:
+//
+//   V2 (pre-fork)   b_seed = blake3(job_key || B_root)
+//                   a_seed = blake3(b_seed  || A_root)
+//
+//   V3 (salted-seed hardfork, pearl PR #280 + #282, mainnet height 99,000)
+//                   bound_a = blake3_keyed(SALT_A, A_root || m_le32 || 0^28)
+//                   bound_b = blake3_keyed(SALT_B, B_root || n_le32 || 0^28)
+//                   b_seed  = blake3(job_key || bound_b)
+//                   a_seed  = blake3(b_seed  || bound_a)
+//
+// The binding commits each root to the dimension it was built from — A to the
+// row count m, B to the column count n.
+//
+// The bound message is EXACTLY one 64-byte block: 32-byte root, the dimension as
+// a little-endian u32, then 28 zero bytes. Pass len=64, never len=36 and let
+// hash_small pad: BLAKE3 mixes the input length into the final block, so the
+// padded-to-64 and 36-byte-input hashes differ.
 inline void launch_commitment_hash(const uint8_t* AHash, const uint8_t* BHash,
                                     const uint8_t* Key,
                                     uint8_t* CommitA, uint8_t* CommitB,
+                                    int m, int n, bool salted,
                                     sycl::queue* q) {
     q->single_task<KCommitment>([=]() {
-        uint8_t buf[64];
-        for (int i = 0; i < 32; ++i) { buf[i] = Key[i]; buf[32+i] = BHash[i]; }
-        b3::hash_small(buf, 64, nullptr, CommitB);
-        for (int i = 0; i < 32; ++i) { buf[i] = CommitB[i]; buf[32+i] = AHash[i]; }
-        b3::hash_small(buf, 64, nullptr, CommitA);
+        // blake3("pearl/cert-v3/noise-seed/{A,B}") as little-endian u32 words.
+        // Hardcoded so the hot path does not hash a string every iteration;
+        // VERIFIED against our own BLAKE3 rather than copied on trust.
+        const u32 SALT_A[8] = { 0x6C404982u, 0x1615EDA0u, 0x92F61696u, 0xF876F0FCu,
+                                0x2ADBDB92u, 0x52B82370u, 0x1977D4F0u, 0x7B0190C3u };
+        const u32 SALT_B[8] = { 0x32063011u, 0xCA0163ECu, 0x71AFE22Bu, 0x4F4D3F8Bu,
+                                0x39C6E91Au, 0x04CCE888u, 0x1D304448u, 0xA99AB871u };
+
+        u32 msg[16];
+        uint8_t boundA[32], boundB[32];
+
+        // Default to the raw roots; V3 replaces them with their bound forms.
+        const uint8_t* aRoot = AHash;
+        const uint8_t* bRoot = BHash;
+
+        if (salted) {
+            for (int i = 0; i < 16; ++i) msg[i] = 0;
+            for (int i = 0; i < 8; ++i) msg[i] = b3::load_le32(AHash + i * 4);
+            msg[8] = (u32)m;
+            b3::hash_block(msg, SALT_A, boundA);
+
+            for (int i = 0; i < 16; ++i) msg[i] = 0;
+            for (int i = 0; i < 8; ++i) msg[i] = b3::load_le32(BHash + i * 4);
+            msg[8] = (u32)n;
+            b3::hash_block(msg, SALT_B, boundB);
+
+            aRoot = boundA;
+            bRoot = boundB;
+        }
+
+        for (int i = 0; i < 8; ++i) msg[i] = b3::load_le32(Key + i * 4);
+        for (int i = 0; i < 8; ++i) msg[8 + i] = b3::load_le32(bRoot + i * 4);
+        b3::hash_block(msg, nullptr, CommitB);
+
+        for (int i = 0; i < 8; ++i) msg[i] = b3::load_le32(CommitB + i * 4);
+        for (int i = 0; i < 8; ++i) msg[8 + i] = b3::load_le32(aRoot + i * 4);
+        b3::hash_block(msg, nullptr, CommitA);
     });
 }
 
@@ -315,13 +447,12 @@ inline void launch_noise_gen(int R, int m, int n, int k,
         q->parallel_for<KUniformA>(sycl::range<1>((size_t)((nh+tpb-1)/tpb)*tpb),
             [=](sycl::id<1> id) {
                 int i = (int)id[0]; if (i >= nh) return;
-                uint8_t msg[64] = {};
-                msg[0] = (uint8_t)((1+i)    ); msg[1] = (uint8_t)((1+i)>> 8);
-                msg[2] = (uint8_t)((1+i)>>16); msg[3] = (uint8_t)((1+i)>>24);
-                // seed = "A_tensor" at msg[32..39]
-                msg[32]='A'; msg[33]='_'; msg[34]='t'; msg[35]='e';
-                msg[36]='n'; msg[37]='s'; msg[38]='o'; msg[39]='r';
-                alignas(4) uint8_t h[32]; b3::hash_small(msg, 64, (const u32*)key_A, h);
+                u32 msg[16] = {};
+                msg[0] = (u32)(1 + i);
+                // seed = "A_tensor" at msg[32..39] -> msg[8..9]
+                msg[8] = 0x65745F41u; // 'A', '_', 't', 'e'
+                msg[9] = 0x726F736Eu; // 'n', 's', 'o', 'r'
+                alignas(4) uint8_t h[32]; b3::hash_block(msg, (const u32*)key_A, h);
                 for (int j = 0; j < 32; ++j) {
                     int idx = i*32+j;
                     if (idx < nb) {
@@ -344,16 +475,17 @@ inline void launch_noise_gen(int R, int m, int n, int k,
         if (Km) q->memset(Km, 0, (size_t)R * k);
         if (Rm) q->memset(Rm, 0, (size_t)k * R);
         int req = k, draws = (req*4 + 31) / 32;
+        const u32 tag0 = (u32)s0 | ((u32)s1 << 8) | ((u32)s2 << 16) | ((u32)s3 << 24);
+        const u32 tag1 = (u32)s4 | ((u32)s5 << 8) | ((u32)s6 << 16) | ((u32)s7 << 24);
         q->parallel_for<KPerm>(sycl::range<1>((size_t)((draws+tpb-1)/tpb)*tpb),
             [=](sycl::id<1> id) {
                 int i = (int)id[0]; if (i >= draws) return;
-                uint8_t msg[64] = {};
-                msg[4]  = (uint8_t)((1+i)     ); msg[5] = (uint8_t)((1+i)>> 8);
-                msg[6]  = (uint8_t)((1+i)>>16 ); msg[7] = (uint8_t)((1+i)>>24);
-                // seed tag in [32..39]; rest zero
-                msg[32]=s0; msg[33]=s1; msg[34]=s2; msg[35]=s3;
-                msg[36]=s4; msg[37]=s5; msg[38]=s6; msg[39]=s7;
-                u32 h[8]; b3::hash_small_u32(msg, 64, (const u32*)perm_key, h);
+                u32 msg[16] = {};
+                msg[1] = (u32)(1 + i);
+                // seed tag in [32..39] -> msg[8..9]
+                msg[8] = tag0;
+                msg[9] = tag1;
+                u32 h[8]; b3::hash_block_u32(msg, (const u32*)perm_key, h);
                 for (int kk = 0; kk < 8; ++kk) {
                     int L = i*8 + kk; if (L >= req) break;
                     u32 u = h[kk];
@@ -378,12 +510,11 @@ inline void launch_noise_gen(int R, int m, int n, int k,
         q->parallel_for<KUniformB>(sycl::range<1>((size_t)((nh+tpb-1)/tpb)*tpb),
             [=](sycl::id<1> id) {
                 int i = (int)id[0]; if (i >= nh) return;
-                uint8_t msg[64] = {};
-                msg[0] = (uint8_t)((1+i)    ); msg[1] = (uint8_t)((1+i)>> 8);
-                msg[2] = (uint8_t)((1+i)>>16); msg[3] = (uint8_t)((1+i)>>24);
-                msg[32]='B'; msg[33]='_'; msg[34]='t'; msg[35]='e';
-                msg[36]='n'; msg[37]='s'; msg[38]='o'; msg[39]='r';
-                alignas(4) uint8_t h[32]; b3::hash_small(msg, 64, (const u32*)key_B, h);
+                u32 msg[16] = {};
+                msg[0] = (u32)(1 + i);
+                msg[8] = 0x65745F42u; // 'B', '_', 't', 'e'
+                msg[9] = 0x726F736Eu; // 'n', 's', 'o', 'r'
+                alignas(4) uint8_t h[32]; b3::hash_block(msg, (const u32*)key_B, h);
                 for (int j = 0; j < 32; ++j) {
                     int idx = i*32+j;
                     if (idx < nb) {
@@ -510,6 +641,7 @@ inline void gemm_i8_xmx(const int8_t* A, const int8_t* B, int32_t* C,
         cgh.parallel_for<KGemmI8X<SG>>(
             sycl::nd_range<2>({(size_t)nGroups, (size_t)rowBlocks * SG}, {1, SG}),
             [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(SG)]] {
+              xmx_arch_guard<SG>([&]{                 // fat-AOT: elide foreign-gen DPAS per image
                 auto sg = item.get_sub_group();
                 int grp_col = (int)item.get_group(0);
                 int grp_row = (int)item.get_group(1);
@@ -534,6 +666,7 @@ inline void gemm_i8_xmx(const int8_t* A, const int8_t* B, int32_t* C,
                     xmx::joint_matrix_store(sg, c[t],
                         sycl::multi_ptr<int32_t, sycl::access::address_space::global_space>(
                             C + (size_t)gr0 * N + gc0 + t * XN), (size_t)N, xmx::layout::row_major);
+              });
             });
     });
 }
@@ -625,6 +758,37 @@ inline void launch_tgemm_pow_templated(const int8_t* ApEA, const int8_t* Bt,
     // matrices may be larger: Bt's row stride is nStride (full committed N) so we
     // can search a sub-window [0,m)×[0,n) of a full-size [k, nStride] B matrix.
     if (nStride <= 0) nStride = n;
+    // PERF-PROBE ONLY — every non-zero mode BREAKS correctness (the transcript
+    // is no longer the hashed artifact → no valid shares). Benchmark path only,
+    // NEVER to mine. Default 0 = bit-identical to production.
+    //
+    //   0  production fold                        (default)
+    //   1  skip the whole fold                    (AKOYA_TGEMM_PROBE_NOFOLD=1 → here)
+    //   2  APPLY-ONLY  — read the accumulators, SKIP reduce_over_group
+    //   3  REDUCE-ONLY — SKIP the accumulator reads, keep reduce_over_group
+    //
+    // Modes 2/3 bisect the fold, which mode 1 only ever measured as a lump:
+    //   cost(reduce) ≈ mode0 − mode2      cost(apply) ≈ mode0 − mode3
+    // and the two should roughly sum to the mode0−mode1 total. They answer the
+    // question the batching attempt assumed away (it hoisted the reduces on the
+    // theory they dominated, and came back 1.3% SLOWER).
+    //
+    // WHY THE MODE IS A RUNTIME VALUE, not a template/macro: it is what keeps the
+    // DPAS honest. Because every mode is compiled in, the accumulators mC are read
+    // on a reachable path, so the compiler cannot dead-code the matmul when a probe
+    // skips the reads. Make this compile-time and mode 1/3 would delete the whole
+    // GEMM and report a fantasy number.
+    //
+    // Mode 2 also writes trSlm from EVERY lane rather than just lid==0. That write
+    // is racy and the result is garbage — which is fine here — but it stops the
+    // compiler sinking the joint_matrix_apply work into an `if (lid == 0)` guard
+    // and thereby under-reporting exactly the half being measured.
+    const int probe_fold_mode = [](){
+        if (const char* m = getenv("AKOYA_TGEMM_PROBE_FOLD_MODE")) { int v = atoi(m); if (v >= 0 && v <= 3) return v; }
+        const char* v = getenv("AKOYA_TGEMM_PROBE_NOFOLD");
+        return (v && atoi(v) > 0) ? 1 : 0;
+    }();
+    const bool probe_nofold = (probe_fold_mode == 1);
     // Bt is BpEB transposed to [k,n] row-major (fast XMX use::b row_major load).
     constexpr int TILE = 16;
     constexpr int TM = 8, TK = 32;            // XMX int8 tile: M=8, K=32 on every Xe generation
@@ -656,6 +820,26 @@ inline void launch_tgemm_pow_templated(const int8_t* ApEA, const int8_t* Bt,
         }
         q->submit([&](sycl::handler& cgh) {
             sycl::local_accessor<uint32_t, 1> trSlm(RM * RN * 16, cgh);
+            // PEARL_XMX_FOLD_VIA_MEM: scratch for the store-based transcript fold
+            // (see the fold loop below). NHALF*2 accumulator fragments of TM*TN
+            // int32 = 1-2 KiB; sized 1 when the macro is off so the accessor costs
+            // no SLM on the register path. One work-group == one sub-group
+            // (nd_range {1,SG}), so this buffer is private to this sub-group.
+            //
+            // KEEP THIS SMALL. Staging a whole R-block's fragments instead
+            // (RM*RN*NHALF*2 fragments = 8-16 KiB) was tried on 2026-07-30 to cut
+            // the barrier count 8x: it gave ZERO throughput improvement AND made
+            // Level Zero abort inside the NEO dispatch encoder
+            // ("Abort was called at 655 line in command_encoder_xehp_and_later.inl")
+            // while OpenCL still ran. A single-sub-group work-group asking for
+            // 8-16 KiB of SLM, alongside the 256-GRF request on the RM>=2 kernels,
+            // trips an unrecoverable check on the L0 path. See
+            // docs/IGC-BUG-coop-matrix-aot.md.
+#if defined(PEARL_XMX_FOLD_VIA_MEM)
+            sycl::local_accessor<int32_t, 1> foldSlm(2 * NHALF * TM * TN, cgh);
+#else
+            sycl::local_accessor<int32_t, 1> foldSlm(1, cgh);
+#endif
             // Column-major traversal: M is the FAST grid dimension (dim1) so
             // work-groups dispatched together share an N-group and keep its B
             // columns hot in L2 across all M-tiles (~8× less GDDR6 B traffic).
@@ -666,6 +850,7 @@ inline void launch_tgemm_pow_templated(const int8_t* ApEA, const int8_t* Bt,
             // 12.8 TMADs/s at 128 GRF, runs 35.9 at 256 on a B580). RM==1
             // kernels keep the default GRF and full occupancy.
             auto kfn = [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(SG)]] {
+                  xmx_arch_guard<SG>([&]{               // fat-AOT: elide foreign-gen DPAS per image
                     auto sg = item.get_sub_group();
                     int grp_col = (int)item.get_group(0);   // N-group (slow)
                     int grp_row = (int)item.get_group(1);   // M-group (fast)
@@ -716,23 +901,103 @@ inline void launch_tgemm_pow_templated(const int8_t* ApEA, const int8_t* Bt,
                             }
                         }
 
-                        // --- Transcript snap once per R-block (barrier-free XOR) ---
+                        // --- Transcript snap once per R-block ---
                         // Every int32 partial of the 16×16 tile is XORed exactly
                         // once, across however many fragments cover the tile —
-                        // bit-identical for NHALF==1 and NHALF==2.
+                        // bit-identical for NHALF==1 and NHALF==2. Default path is
+                        // barrier-free (register XOR via joint_matrix_apply);
+                        // PEARL_XMX_FOLD_VIA_MEM trades that for an SLM round-trip
+                        // to dodge the IGC AOT bug (see below).
+                        if (!probe_nofold) {                      // PROBE: skip fold to measure its cost
+                        // COST OF THIS FOLD, measured on 2x B580 @2400MHz locked,
+                        // NB=4 MB=2 SEARCH_M=4096, via AKOYA_TGEMM_PROBE_NOFOLD
+                        // (2026-08-10):
+                        //
+                        //          fold ON        fold OFF      cost
+                        //   R=128  30.3 / 72.6ms  34.4 / 63.9   8.7ms = 12.0%
+                        //   R=256  32.3 / 68.0ms  33.5 / 65.6   2.4ms =  3.5%
+                        //
+                        // R is the transcript block size, so halving it doubles the
+                        // fold COUNT (k/R blocks) while total DPAS work stays k/TK,
+                        // i.e. R-invariant. With the fold removed the two ranks are
+                        // equal — so 100% of rank 128's penalty is this fold, and
+                        // R=128-without-fold (34.4) beats R=256-with-fold (32.3).
+                        // The fold count cannot be reduced: the transcript is the
+                        // hashed artifact, so its block boundaries are consensus.
+                        //
+                        // TRIED AND REJECTED — batching the reductions (2026-08-10):
+                        // the RM*RN reduce_over_group calls are mutually independent,
+                        // so hoisting them out of the (mb,t) loop into one array pass
+                        // "should" let their shuffle chains overlap. Measured on the
+                        // rig: 30.2 vs 30.6 TMADs/s, i.e. 1.3% SLOWER. Either the
+                        // compiler already interleaves them or the RM*RN live uint32s
+                        // cost more than the overlap wins at grf_size<256>. Do not
+                        // re-try without first bisecting the fold (apply-only vs
+                        // reduce-only) to establish which half actually dominates —
+                        // that was never measured, and the batching attempt assumed
+                        // the reduce did.
                         for (int mb = 0; mb < RM; ++mb)
                             for (int t = 0; t < RN; ++t) {
                                 uint32_t part = 0;
+#if defined(PEARL_XMX_FOLD_VIA_MEM)
+                                // Linux AOT workaround — see docs/IGC-BUG-coop-matrix-aot.md.
+                                // joint_matrix_apply element access on an sg16 int32
+                                // accumulator emits __spirv_AccessChain into a
+                                // CooperativeMatrixKHR target-extension type, which IGC's
+                                // AOT gen backend fails to lower (JIT and Windows AOT are
+                                // fine) — forcing Linux to JIT-only, ~5% slower.
+                                // joint_matrix_store is a plain distributed block write, no
+                                // AccessChain, so it dodges the bug. The fold is a pure XOR
+                                // over the SAME multiset of int32 partials (both paths cover
+                                // every element of all 2*NHALF fragments exactly once) and
+                                // XOR is commutative+associative ⇒ BIT-IDENTICAL transcript,
+                                // hence identical shares.
+                                sycl::group_barrier(sg);   // previous (mb,t)'s reads retired
                                 for (int h = 0; h < NHALF; ++h) {
-                                    xmx::joint_matrix_apply(sg, mC[2*mb][t*NHALF+h],   [&](int32_t v) { part ^= (uint32_t)v; });
-                                    xmx::joint_matrix_apply(sg, mC[2*mb+1][t*NHALF+h], [&](int32_t v) { part ^= (uint32_t)v; });
+                                    xmx::joint_matrix_store(sg, mC[2*mb][t*NHALF+h],
+                                        foldSlm.template get_multi_ptr<sycl::access::decorated::no>()
+                                            + (size_t)(2*h) * (TM * TN),
+                                        (size_t)TN, xmx::layout::row_major);
+                                    xmx::joint_matrix_store(sg, mC[2*mb+1][t*NHALF+h],
+                                        foldSlm.template get_multi_ptr<sycl::access::decorated::no>()
+                                            + (size_t)(2*h + 1) * (TM * TN),
+                                        (size_t)TN, xmx::layout::row_major);
                                 }
-                                uint32_t xv = sycl::reduce_over_group(sg, part, sycl::bit_xor<uint32_t>());
-                                if (lid == 0) {
-                                    int idx = (mb * RN + t) * 16 + snap % 16;
-                                    trSlm[idx] = b3::rotl32(trSlm[idx], 13) ^ xv;
+                                sycl::group_barrier(sg);   // stores visible sub-group-wide
+                                // Lane `lid` takes column `lid` of every fragment: TM ints
+                                // per fragment per lane, TN lanes ⇒ each of the TM*TN
+                                // elements read exactly once before the cross-lane XOR.
+                                for (int f = 0; f < 2 * NHALF; ++f)
+                                    for (int r = 0; r < TM; ++r)
+                                        part ^= (uint32_t)foldSlm[f * (TM * TN) + r * TN + lid];
+#else
+                                // mode 3 (REDUCE-ONLY) skips the accumulator reads. `part`
+                                // is then seeded from the R-block counter and lane id so it
+                                // stays non-uniform and non-constant-foldable — otherwise the
+                                // compiler could fold the reduce away and we would "measure"
+                                // a shuffle chain that no longer exists.
+                                if (probe_fold_mode != 3) {
+                                    for (int h = 0; h < NHALF; ++h) {
+                                        xmx::joint_matrix_apply(sg, mC[2*mb][t*NHALF+h],   [&](int32_t v) { part ^= (uint32_t)v; });
+                                        xmx::joint_matrix_apply(sg, mC[2*mb+1][t*NHALF+h], [&](int32_t v) { part ^= (uint32_t)v; });
+                                    }
+                                } else {
+                                    part = (uint32_t)(kb + lid + mb * RN + t);
+                                }
+#endif
+                                int idx = (mb * RN + t) * 16 + snap % 16;
+                                if (probe_fold_mode == 2) {
+                                    // APPLY-ONLY: no cross-lane reduce. Every lane writes so
+                                    // the applies cannot be sunk into a leader-only branch.
+                                    trSlm[idx] = b3::rotl32(trSlm[idx], 13) ^ part;
+                                } else {
+                                    uint32_t xv = sycl::reduce_over_group(sg, part, sycl::bit_xor<uint32_t>());
+                                    if (lid == 0) {
+                                        trSlm[idx] = b3::rotl32(trSlm[idx], 13) ^ xv;
+                                    }
                                 }
                             }
+                        }                                         // end if (!probe_nofold)
                         ++snap;
                     }
 
@@ -740,15 +1005,12 @@ inline void launch_tgemm_pow_templated(const int8_t* ApEA, const int8_t* Bt,
                     if (lid == 0) {
                         for (int mb = 0; mb < RM; ++mb)
                             for (int t = 0; t < RN; ++t) {
-                                // alignas + direct 32-bit word copies (Gemini fix #5):
-                                // LE hardware ⇒ bit-identical to the byte writes, no
-                                // shift/mask. tb stays on thread 0 → no register-file
-                                // blowup. hash_small byte-copies tb internally.
-                                alignas(4) uint8_t tb[64];
+                                // Direct 32-bit word loads from trSlm and in-place BLAKE3 block hash
+                                u32 bl[16];
                                 for (int e = 0; e < 16; ++e)
-                                    reinterpret_cast<uint32_t*>(tb)[e] = trSlm[(mb * RN + t) * 16 + e];
+                                    bl[e] = trSlm[(mb * RN + t) * 16 + e];
                                 u32 hw[8];
-                                b3::hash_small_u32(tb, 64, pow_key, hw);
+                                b3::hash_block_u32(bl, pow_key, hw);
                                 int fnd = 1;
                                 for (int e = 7; e >= 0; --e) {
                                     if (hw[e] > pow_target[e]) { fnd = 0; break; }
@@ -779,6 +1041,7 @@ inline void launch_tgemm_pow_templated(const int8_t* ApEA, const int8_t* Bt,
                                 }
                             }
                     }
+                  });
                 };
             if constexpr (RM >= 2) {
                 sycl::ext::oneapi::experimental::properties props{
@@ -798,12 +1061,12 @@ inline void launch_tgemm_pow_templated(const int8_t* ApEA, const int8_t* Bt,
     //   • Xe-HPG (sg8, NHALF=2): NB=4 → 16 fragments → ~128 int32/lane, which
     //     SPILLS the smaller Xe-HPG GRF and craters throughput (~60× under
     //     potential). NB=2 → 8 fragments → matches the Xe2 footprint.
-    // So the per-arch default is NB=2 on sg8, NB=4 on sg16. AKOYA_TGEMM_NB
+    // So the per-arch default is NB=2 on sg8, NB=4 on sg16. ARC_TGEMM_NB
     // overrides it to sweep {1,2,4} on a tester. Re-blocking N only changes the
     // grid decomposition; each output tile's transcript/PoW is computed from its
     // own accumulators, so results are BIT-IDENTICAL across NB — shares unchanged.
     //
-    // AKOYA_TGEMM_MB (default 1) blocks M the same way: MB=2 reuses each loaded
+    // ARC_TGEMM_MB (default 1) blocks M the same way: MB=2 reuses each loaded
     // B fragment across 4 A-mads instead of 2 (loads/mad 0.75 → 0.5) at the cost
     // of doubling the mA/mC register footprint — MB=2×NB=4 only fits in
     // large-GRF mode (SYCL_PROGRAM_COMPILE_OPTIONS=-cl-intel-256-GRF-per-thread).
@@ -819,9 +1082,12 @@ inline void launch_tgemm_pow_templated(const int8_t* ApEA, const int8_t* Bt,
     };
     // Defaults: Xe2 (sg16) → MB=2 (+8% on B580: 33.3 → 35.9 TMADs/s, with the
     // grf_size<256> property baked into the RM>=2 kernels above); Xe-HPG (sg8)
-    // → MB=1 until validated on A-series hardware. AKOYA_TGEMM_MB=1|2 overrides.
-    int nbEnv = []{ const char* v = getenv("AKOYA_TGEMM_NB"); return (v && atoi(v) > 0) ? atoi(v) : 0; }();
-    int mbEnv = []{ const char* v = getenv("AKOYA_TGEMM_MB"); return (v && atoi(v) > 0) ? atoi(v) : 0; }();
+    // → MB=1 until validated on A-series hardware. ARC_TGEMM_MB=1|2 overrides.
+    // CAUTION: the "measured" figures in these comments predate the ARC_*/AKOYA_*
+    // knob fix, so any of them produced by setting ARC_TGEMM_* never actually
+    // changed NB/MB — treat them as unverified until re-measured.
+    int nbEnv = tune_env_int("TGEMM_NB", 0);   // ARC_TGEMM_NB (legacy: AKOYA_TGEMM_NB)
+    int mbEnv = tune_env_int("TGEMM_MB", 0);   // ARC_TGEMM_MB (legacy: AKOYA_TGEMM_MB)
 #if defined(PEARL_XMX_ONLY_SG8)
     dispatchMB(std::integral_constant<int, 8>{},  nbEnv > 0 ? nbEnv : 2, mbEnv > 0 ? mbEnv : 1);
 #elif defined(PEARL_XMX_ONLY_SG16)
@@ -839,9 +1105,17 @@ inline void launch_tgemm_pow(const int8_t* ApEA, const int8_t* Bt,
                               sycl::queue* q, int nStride = 0) {
     // The compile-time-R full unroll (R_const>0) pipelines well on Xe2's large
     // sg16 register file (+~1 TH/s on B580) but SPILLS the smaller Xe-HPG sg8 GRF
-    // — measured ~10x slower tgemm on an A750 (rank-256). So restrict the unrolled
-    // variants to sg16; sg8 (Xe-HPG) uses the dynamic R_const=0 loop, which is the
+    // — measured ~10x slower tgemm on an A750. So restrict the unrolled variant to
+    // sg16; sg8 (Xe-HPG) uses the dynamic R_const=0 loop, which is the
     // validated-correct behaviour the pre-fixs2 A750 build ran (bit-identical math).
+    //
+    // Only R=128 is specialized. The rank-penalty softfork (pearl PR #275) put a
+    // consensus floor at 128 and scales the jackpot bound by 128/rank, so every
+    // rank above it does proportionally more work for the same reward — nobody
+    // mines 256 by choice, and the <256> instantiation was pure binary weight.
+    // Any other R still runs correctly via the R_const=0 dynamic loop below, just
+    // without the unroll; that path is bit-identical, so this costs speed, never
+    // validity.
 #if defined(PEARL_XMX_ONLY_SG8)
     constexpr bool hpg = true;
 #elif defined(PEARL_XMX_ONLY_SG16)
@@ -849,9 +1123,7 @@ inline void launch_tgemm_pow(const int8_t* ApEA, const int8_t* Bt,
 #else
     bool hpg = is_xe_hpg(q);
 #endif
-    if (!hpg && R == 256) {
-        launch_tgemm_pow_templated<256>(ApEA, Bt, m, n, k, R, pow_key, pow_target, host_signal, hdr, q, nStride);
-    } else if (!hpg && R == 128) {
+    if (!hpg && R == 128) {
         launch_tgemm_pow_templated<128>(ApEA, Bt, m, n, k, R, pow_key, pow_target, host_signal, hdr, q, nStride);
     } else {
         launch_tgemm_pow_templated<0>(ApEA, Bt, m, n, k, R, pow_key, pow_target, host_signal, hdr, q, nStride);

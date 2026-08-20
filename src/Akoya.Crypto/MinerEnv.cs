@@ -1,22 +1,14 @@
 namespace Akoya.Crypto;
 
 /// <summary>
-/// Configuration env-var reader with the user-facing <c>ARC_</c> prefix.
-/// Every variable is documented to end users as <c>ARC_*</c>; the legacy
-/// <c>AKOYA_*</c> name is still honoured silently so existing rigs, launch
-/// scripts and HiveOS templates keep working. ARC_ wins when both are set.
+/// Configuration env-var reader. All variables use the <c>ARC_</c> prefix.
+/// Returns null for unset or empty values so callers can use <c>??</c> defaults.
 /// </summary>
 public static class MinerEnv
 {
-    public static string? Get(string legacyName)
+    public static string? Get(string name)
     {
-        const string LegacyPrefix = "AKOYA_";
-        if (legacyName.StartsWith(LegacyPrefix, StringComparison.Ordinal))
-        {
-            var v = Environment.GetEnvironmentVariable("ARC_" + legacyName[LegacyPrefix.Length..]);
-            if (!string.IsNullOrEmpty(v)) return v;
-        }
-        var legacy = Environment.GetEnvironmentVariable(legacyName);
-        return string.IsNullOrEmpty(legacy) ? null : legacy;
+        var v = Environment.GetEnvironmentVariable(name);
+        return string.IsNullOrEmpty(v) ? null : v;
     }
 }

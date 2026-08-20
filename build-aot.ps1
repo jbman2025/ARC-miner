@@ -22,6 +22,7 @@ $env:LIB  = "$oneapi\compiler\$ver\lib;$env:LIB"
 
 Write-Host "icpx : $((Get-Command icpx).Source)"
 Write-Host "ocloc: $((Get-Command ocloc).Source)"
-if ($SyclArch) { & "$PSScriptRoot\build.ps1" -Backend sycl -SyclArch $SyclArch -Out $Out }
-else           { & "$PSScriptRoot\build.ps1" -Backend sycl -Out $Out }
+# -Backend is gone: build.ps1 is SYCL-only since the CUDA/ROCm removal.
+if ($SyclArch) { & "$PSScriptRoot\build.ps1" -SyclArch $SyclArch -Out $Out }
+else           { & "$PSScriptRoot\build.ps1" -Out $Out }
 exit $LASTEXITCODE

@@ -99,7 +99,7 @@ public sealed class MiningSession : IPoolSession, IEventSink
     //     otherwise we refresh it to "now" (we don't know the exact second-
     //     oldest, but it's guaranteed not older than now).
     // Default deadline 20s = ~1.3× ping interval. Override via
-    // AKOYA_POOL_PONG_TIMEOUT_SEC; 0 disables this check.
+    // ARC_POOL_PONG_TIMEOUT_SEC; 0 disables this check.
     private long _oldestPendingPingTicks;
     private int  _pendingPingCount;
 
@@ -235,7 +235,7 @@ public sealed class MiningSession : IPoolSession, IEventSink
                 _pool.Endpoint,
                 $"pool unreachable: gRPC {e.StatusCode} after {RegisterResumeDeadline.TotalSeconds:F0}s " +
                 $"connecting to {_pool.Endpoint} — verify host/port and firewall " +
-                $"(AKOYA_POOL_HOST / AKOYA_POOL_PORT)",
+                $"(ARC_POOL_HOST / ARC_POOL_PORT)",
                 e);
         }
         catch (OperationCanceledException oce)
@@ -248,7 +248,7 @@ public sealed class MiningSession : IPoolSession, IEventSink
                 _pool.Endpoint,
                 $"pool unreachable: timed out after {RegisterResumeDeadline.TotalSeconds:F0}s " +
                 $"connecting to {_pool.Endpoint} (gRPC channel never became ready) — " +
-                $"verify host/port and firewall (AKOYA_POOL_HOST / AKOYA_POOL_PORT)",
+                $"verify host/port and firewall (ARC_POOL_HOST / ARC_POOL_PORT)",
                 oce);
         }
 
@@ -688,5 +688,5 @@ public sealed class MiningSession : IPoolSession, IEventSink
 
     // --- byte/hex helpers -------------------------------------------------
     private static string BytesToHex(byte[] b) => Convert.ToHexString(b).ToLowerInvariant();
-    private static byte[] HexToBytes(string s) => Convert.FromHexString(s);
+    private static byte[] HexToBytes(string hex) => Akoya.Crypto.Hex.Decode(hex);
 }

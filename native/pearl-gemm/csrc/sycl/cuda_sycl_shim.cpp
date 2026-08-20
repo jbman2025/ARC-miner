@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <vector>
 #include <mutex>
+#include <unordered_map>
 
 // Kernel name tag for cuEventRecord no-op marker (must be at namespace scope).
 struct RecordTag {};
@@ -137,7 +138,30 @@ CUDA_EXPORT int cuDeviceTotalMem_v2(size_t* b, int dev) {
     return 0;
 }
 
-CUDA_EXPORT int cuDeviceGetPCIBusId(char* s, int len, int) {
+// Report the device's REAL PCI address. This used to return a hard-coded
+// "0000:00:00.0" for every device, which made it useless for telling cards
+// apart — and the sysfs hwmon sensors (temperature, fan, energy) are keyed by
+// exactly this string, so without it a multi-GPU rig can only guess which
+// reading belongs to which card. Guessing wrong reports card A's temperature
+// against card B, which is worse than showing nothing at all.
+//
+// ext::intel::info::device::pci_address is available on the OpenCL backend, not
+// just Level Zero — verified on a 2x Arc B580 rig, which matters because a stock
+// HiveOS install has no Level Zero at all.
+CUDA_EXPORT int cuDeviceGetPCIBusId(char* s, int len, int dev) {
+    if (!s || len <= 0) return 1;   // CUDA_ERROR_INVALID_VALUE
+    init_devices();
+    if (dev >= 0 && dev < (int)g_devs.size()) {
+        try {
+            auto addr = g_devs[dev]->dev
+                .get_info<sycl::ext::intel::info::device::pci_address>();
+            snprintf(s, len, "%s", addr.c_str());
+            return 0;
+        } catch (...) {
+            // Older runtimes gate this behind SYCL_ENABLE_PCI; fall through to
+            // the placeholder rather than failing the call.
+        }
+    }
     snprintf(s, len, "0000:00:00.0");
     return 0;
 }
@@ -200,18 +224,55 @@ CUDA_EXPORT int cuCtxSetCurrent(void* ctx) {
 }
 
 // ── Memory ────────────────────────────────────────────────────────────────────
+//
+// Multi-GPU correctness: USM pointers are CONTEXT-bound. The original frees
+// used cur_state() — the calling THREAD's current device — so a pointer
+// allocated for device 1 but freed from a thread parked on device 0 (GC,
+// orchestrator, finalizer) was released against the wrong sycl::context.
+// NEO's OpenCL USM tracking corrupted on that (observed with 2× B580:
+// SIGSEGV in urUSMFree / abort in enqueue_svm.h). Record the owning device
+// per allocation and always free against it; serialize alloc/free since
+// NEO also raced on concurrent multi-context alloc/free.
+//
+// STATUS 2026-07-30: multi-GPU OpenCL now runs clean in the field (2× B580,
+// intel-opencl-icd 25.18.33578.6), so the NEO race appears fixed.
+//
+// The owner map STAYS REGARDLESS, and not because of NEO: freeing a USM pointer
+// against a different sycl::context than it was allocated from is invalid by the
+// SYCL spec, full stop. NEO's corruption was the symptom that exposed the bug,
+// not the cause of it — a better driver just makes the same misuse fail more
+// quietly. Only the alloc/free SERIALIZATION here is a NEO workaround and thus
+// arguably obsolete; the g_ptr_owner lookup is plain correctness.
+static std::mutex g_mem_mu;
+static std::unordered_map<void*, DeviceState*> g_ptr_owner;
+
+static void record_owner(void* p, DeviceState* s) {
+    std::lock_guard<std::mutex> lk(g_mem_mu);
+    g_ptr_owner[p] = s;
+}
+static DeviceState* take_owner(void* p) {
+    std::lock_guard<std::mutex> lk(g_mem_mu);
+    auto it = g_ptr_owner.find(p);
+    if (it == g_ptr_owner.end()) return nullptr;
+    DeviceState* s = it->second;
+    g_ptr_owner.erase(it);
+    return s;
+}
 
 CUDA_EXPORT int cuMemAlloc_v2(void** dptr, size_t n) {
     auto* s = cur_state();
     if (!s) return -1;
     auto* q = ensure_default_queue(s);
     *dptr = sycl::malloc_device(n, *q);
+    if (*dptr) record_owner(*dptr, s);
     return *dptr ? 0 : -1;
 }
 
 CUDA_EXPORT int cuMemFree_v2(void* dptr) {
-    auto* s = cur_state();
-    if (!s || !dptr) return -1;
+    if (!dptr) return -1;
+    DeviceState* s = take_owner(dptr);
+    if (!s) s = cur_state();          // pre-tracking pointer: old behaviour
+    if (!s) return -1;
     auto* q = ensure_default_queue(s);
     sycl::free(dptr, *q);
     return 0;
@@ -231,12 +292,15 @@ CUDA_EXPORT int cuMemHostAlloc(void** pp, size_t n, unsigned int) {
     if (!s) return -1;
     auto* q = ensure_default_queue(s);
     *pp = sycl::malloc_host(n, *q);
+    if (*pp) record_owner(*pp, s);
     return *pp ? 0 : -1;
 }
 
 CUDA_EXPORT int cuMemFreeHost(void* p) {
-    auto* s = cur_state();
-    if (!s || !p) return -1;
+    if (!p) return -1;
+    DeviceState* s = take_owner(p);
+    if (!s) s = cur_state();          // pre-tracking pointer: old behaviour
+    if (!s) return -1;
     auto* q = ensure_default_queue(s);
     sycl::free(p, *q);
     return 0;

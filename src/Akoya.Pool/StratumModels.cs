@@ -30,37 +30,11 @@ public sealed class StratumMessage
 
     [JsonPropertyName("error")]
     public System.Text.Json.JsonElement? Error { get; set; }
+
+    [JsonPropertyName("type")]
+    public string? Type { get; set; }
 }
 
-public sealed class StratumShareSubmission
-{
-    [JsonPropertyName("sigma")]
-    public string Sigma { get; set; } = string.Empty;
-    
-    [JsonPropertyName("config_bytes")]
-    public string ConfigBytes { get; set; } = string.Empty;
-    
-    [JsonPropertyName("hash_a")]
-    public string HashA { get; set; } = string.Empty;
-    
-    [JsonPropertyName("hash_b")]
-    public string HashB { get; set; } = string.Empty;
-    
-    [JsonPropertyName("a_slice")]
-    public string ASlice { get; set; } = string.Empty;
-    
-    [JsonPropertyName("b_slice")]
-    public string BSlice { get; set; } = string.Empty;
-    
-    [JsonPropertyName("claimed_hash")]
-    public string ClaimedHash { get; set; } = string.Empty;
-    
-    [JsonPropertyName("tile_row")]
-    public int TileRow { get; set; }
-    
-    [JsonPropertyName("tile_col")]
-    public int TileCol { get; set; }
-}
 
 public sealed class StratumAuthorizeRequest
 {
@@ -84,6 +58,9 @@ public sealed class StratumAuthorizeParams
 
     [JsonPropertyName("agent")]
     public string Agent { get; set; } = string.Empty;
+
+    [JsonPropertyName("type")]
+    public string? Type { get; set; }
 }
 
 public sealed class StratumNotifyParams
@@ -99,6 +76,12 @@ public sealed class StratumNotifyParams
 
     [JsonPropertyName("height")]
     public long Height { get; set; }
+
+    [JsonPropertyName("b_seed")]
+    public string? BSeed { get; set; }
+
+    [JsonPropertyName("audit_k")]
+    public uint? AuditK { get; set; }
 }
 
 public sealed class StratumSubmitRequest
@@ -124,7 +107,6 @@ public sealed class StratumSubmitParams
 
 [JsonSerializable(typeof(StratumRequest))]
 [JsonSerializable(typeof(StratumMessage))]
-[JsonSerializable(typeof(StratumShareSubmission))]
 [JsonSerializable(typeof(StratumAuthorizeRequest))]
 [JsonSerializable(typeof(StratumAuthorizeParams))]
 [JsonSerializable(typeof(StratumNotifyParams))]

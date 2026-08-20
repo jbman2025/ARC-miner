@@ -31,7 +31,22 @@ extern "C" {
 #endif
 
 // ABI version. Bumped on incompatible signature changes.
+//
+//   4 — PearlCapiInstallBParams gained `salted_seeds`, and install_B derives
+//       the B-side seed with the real m/n and flag instead of routing through a
+//       wrapper that hardcoded (0, 0, false). Below v4 the ENTIRE B-side noise
+//       field is built from a legacy seed once per σ and never corrected, so
+//       every share is unprovable post-fork.
+//   3 — PearlCapiWorkspaceParams gained `salted_seeds`, and the per-iter
+//       commitment hash reads it instead of the process global. A v2 library
+//       loaded by a v3 host would ignore the field and silently derive legacy
+//       seeds for every share, so the host MUST refuse to mine below 3 rather
+//       than discover it as a 100% reject rate.
+//   2 — baseline.
 int pearl_capi_abi_version(void);
+
+// Lowest ABI this header's params-struct layouts are compatible with.
+#define PEARL_CAPI_MIN_ABI 4
 
 // Native build profile reporting. Used by miner startup to fail fast when a
 // loaded architecture-specific .so cannot run on the selected GPU.
@@ -103,13 +118,34 @@ int pearl_capi_bseed_expand_and_tensor_hash_leaf_cvs(
                                             int            device_id,
                                             void*          stream);
 
-int pearl_capi_commitment_hash_from_merkle_roots(const uint8_t* A_merkle_root,
-                                                 const uint8_t* B_merkle_root,
-                                                 const uint8_t* key,
-                                                 uint8_t*       A_commitment_hash,
-                                                 uint8_t*       B_commitment_hash,
-                                                 int            device_id,
-                                                 void*          stream);
+// Salted-seed hardfork (pearl PR #280 + #282, mainnet height 99,000).
+//
+// NOT the mining path any more — both the per-iter and install-B paths read the
+// per-σ `salted_seeds` field on their params struct. This remains the process
+// default for callers with no params struct, and for diagnostics.
+// Selects the noise-seed derivation:
+//   0 = V2 legacy   seeds chain straight off the raw Merkle roots
+//   1 = V3 salted   each root is first bound to its dimension under a
+//                   domain-separated keyed BLAKE3 (A→m, B→n)
+//
+// Deliberately a setter and not a params-struct field: adding an export is
+// additive, so this does NOT move the pearl_capi ABI version and an older host
+// still links. Defaults to 0; the host calls it once it knows the chain height.
+// Getting it wrong in either direction produces rejected shares, never
+// silently devalued ones.
+void pearl_capi_set_salted_seed(int on);
+int  pearl_capi_get_salted_seed(void);
+
+// Device-side noise-seed derivation, for host/device equivalence testing.
+// Runs the same kernel the mining path uses. All pointers are HOST memory.
+int pearl_capi_derive_noise_seeds(const uint8_t* A_merkle_root,
+                                  const uint8_t* B_merkle_root,
+                                  const uint8_t* job_key,
+                                  int m, int n, int salted,
+                                  uint8_t* out_a_seed,
+                                  uint8_t* out_b_seed,
+                                  void* stream);
+
 
 // noise_gen. Any nullptr device pointer means the caller does not want
 // that noise matrix populated. R must be 64 or 128. num_threads is fixed
@@ -176,6 +212,17 @@ struct PearlCapiInstallBParams {
     void* BpEB;
     void* workspace;
     void* LeafCvs;  // optional total_leaves x 32B device buffer
+
+    // ABI v4. Noise-seed derivation for THIS σ: 0 = legacy, non-zero = salted/V3.
+    //
+    // This install path derives CommitB and then generates the B-side noise
+    // (EBR/EBL) and BpEB from it, ONCE per σ — the per-iter path never
+    // regenerates them. It previously routed through
+    // pearl_capi_commitment_hash_from_merkle_roots, which hardcodes
+    // (m=0, n=0, salted=false), so post-fork the whole B-side noise field was
+    // built from a LEGACY b_seed while the host proved against the V3 one.
+    // Every share then missed by ~30 bits and was dropped pre-submit.
+    int32_t salted_seeds;
 };
 int pearl_capi_install_B(const struct PearlCapiInstallBParams* p,
                          void* stream);
@@ -294,6 +341,15 @@ struct PearlCapiWorkspaceParams {
     void* host_signal_sync;   // device int8 — dSync coordination block
     void* pow_target;         // device uint32[8]
     void* pow_key;            // device uint32[8]
+
+    // ABI v3. Noise-seed derivation for THIS σ: 0 = legacy (raw Merkle roots),
+    // non-zero = salted/V3 (roots bound to m/n first). Per-workspace and not a
+    // process global on purpose — the host re-derives these same seeds when it
+    // builds a share, and if the two reads straddle a fork flip the miner
+    // searches one noise field and proves another. Carrying it on the σ params
+    // means the value cannot change under a batch that is already in flight.
+    // See pearl_capi_set_salted_seed for the (non-mining) global default.
+    int32_t salted_seeds;
 };
 
 // Install constant params into the workspace.  Must be called before the

@@ -8,7 +8,7 @@
 //   # → target/release/libpearl_mining.so (we typically rename to
 //   #   libpearl_mining_capi.so to disambiguate from the Python build)
 //
-// Caller sets AKOYA_PEARL_MINING_LIB to the absolute path of the .so;
+// Caller sets ARC_PEARL_MINING_LIB to the absolute path of the .so;
 // if unset we fall back to "libpearl_mining_capi.so" on PATH.
 //
 // All entry points return int (0 = success, non-zero = error). On error

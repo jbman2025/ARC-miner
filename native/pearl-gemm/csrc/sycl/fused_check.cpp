@@ -58,23 +58,28 @@ int main() {
     uint8_t* A2      = sycl::malloc_device<uint8_t>(len, q);   // fused (persist window)
     uint8_t* out1    = sycl::malloc_device<uint8_t>(32, q);
     uint8_t* out2    = sycl::malloc_device<uint8_t>(32, q);
+    uint8_t* leaf1   = sycl::malloc_device<uint8_t>((size_t)nchunks * 32, q);  // ref leaf CVs
+    uint8_t* leaf2   = sycl::malloc_device<uint8_t>((size_t)nchunks * 32, q);  // fused leaf CVs
     q.memcpy(key, keyh, 32).wait();
 
-    // Reference: lcg fill(base) -> tensor_hash.
+    // Reference: lcg fill(base) -> tensor_hash (with leaf-CV export).
     pk::launch_lcg_int7_fill(A1, len, base, &q);
-    pk::parallel_tensor_hash(A1, len, key, scratch, out1, &q);
+    pk::parallel_tensor_hash(A1, len, key, scratch, out1, &q, leaf1);
     q.wait();
 
     // Fused: poison A2 first so a missed write is obvious, then run with base.
     q.memset(A2, 0xCC, len).wait();
-    pk::parallel_tensor_hash_fused(A2, len, key, scratch, out2, &q, base, persist);
+    pk::parallel_tensor_hash_fused(A2, len, key, scratch, out2, &q, base, persist, leaf2);
     q.wait();
 
     std::vector<uint8_t> h_out1(32), h_out2(32), h_A1(persist), h_A2(persist);
+    std::vector<uint8_t> h_leaf1((size_t)nchunks*32), h_leaf2((size_t)nchunks*32);
     q.memcpy(h_out1.data(), out1, 32);
     q.memcpy(h_out2.data(), out2, 32);
     q.memcpy(h_A1.data(), A1, persist);
     q.memcpy(h_A2.data(), A2, persist);
+    q.memcpy(h_leaf1.data(), leaf1, (size_t)nchunks*32);
+    q.memcpy(h_leaf2.data(), leaf2, (size_t)nchunks*32);
     q.wait();
 
     int fails = 0;
@@ -94,6 +99,14 @@ int main() {
                 badByte, badByte/k, badByte%k, h_A1[badByte], h_A2[badByte]);
         ++fails;
     } else fprintf(stderr, "OK   persisted A search rows (%ld B) match full LCG\n", persist);
+
+    long badLeaf = -1;
+    for (long c = 0; c < nchunks; ++c)
+        if (memcmp(&h_leaf1[c*32], &h_leaf2[c*32], 32) != 0) { badLeaf = c; break; }
+    if (badLeaf >= 0) {
+        fprintf(stderr, "FAIL leaf CV first diverges at chunk %ld/%ld\n", badLeaf, nchunks);
+        ++fails;
+    } else fprintf(stderr, "OK   all %ld leaf CVs match (proof path)\n", nchunks);
 
     fprintf(stderr, fails ? "\n=== FUSED CHECK FAILED (%d) ===\n" : "\n=== FUSED CHECK PASSED ===\n", fails);
     return fails ? 1 : 0;

@@ -1,12 +1,22 @@
 // Minimal P/Invoke surface for the CUDA Driver API.
-// We use the Driver API (cu*) rather than the Runtime API (cuda*) because
-// it does not require linking libcudart and gives finer control over
-// contexts and stream priorities.
 //
-// Linkage: at runtime we depend on libcuda.so.1 which is provided by the
-// NVIDIA driver itself (not bundled in any toolkit package). Containers
-// that use --gpus all already have it mounted into /usr/lib/x86_64-linux-gnu
-// via the nvidia-container-runtime hook.
+// DO NOT DELETE THIS PROJECT. Despite the name, it is load-bearing on Intel.
+// ARC-miner ships SYCL/oneAPI only — there is no NVIDIA code left in the tree —
+// but the GPU host path still speaks the CUDA Driver API, because that API is
+// implemented ON TOP OF SYCL by our own shim:
+//
+//     native/pearl-gemm/csrc/sycl/cuda_sycl_shim.cpp
+//         -> cuda.dll (Windows) / libcuda.so.1 (Linux)
+//
+// The shim maps CUstream -> sycl::queue*, CUevent -> sycl::event*, and device
+// memory -> USM allocations. Every one of the 34 entrypoints below resolves
+// into it at runtime, NOT into an NVIDIA driver. Removing this project (or
+// swapping it for direct SYCL calls) means rewriting GpuWorker wholesale.
+//
+// We use the Driver API (cu*) rather than the Runtime API (cuda*) because it
+// does not require linking libcudart and gives finer control over contexts and
+// stream priorities — and because the shim only has to implement the subset
+// below.
 //
 // AOT-friendly: every entrypoint uses [LibraryImport] (source-generated
 // stubs) rather than [DllImport].

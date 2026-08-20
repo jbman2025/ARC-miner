@@ -1,6 +1,6 @@
 // NativeEnv — set environment variables the NATIVE kernel's getenv() can see.
 //
-// The SYCL kernel reads its tuning knobs (AKOYA_TGEMM_NB/_MB, AKOYA_SEARCH_M)
+// The SYCL kernel reads its tuning knobs (ARC_TGEMM_NB/_MB, ARC_SEARCH_M)
 // via getenv(), which on Windows resolves to the UCRT (api-ms-win-crt-
 // environment → ucrtbase.dll). .NET's Environment.SetEnvironmentVariable only
 // updates the Win32 process block, which the UCRT's getenv cache NEVER syncs

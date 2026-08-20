@@ -24,7 +24,7 @@ inline u32 rotl32(u32 x, int n) { return (x << n) | (x >> (32 - n)); }
 #define rState(i)     state[i]
 #define rBlock(i)     block[i]
 #define rOrigBlock(i) origblock[i]
-#include "../rocm/blake3_rounds.inc"
+#include "blake3_rounds.inc"
 
 inline void compress(u32 cv[8], const u32 block_in[16], u64 counter,
                      u32 block_len, u32 flags) {
@@ -70,9 +70,33 @@ inline void cv_to_bytes(const u32 cv[8], uint8_t out[32]) {
     }
 }
 
+// Single-block (64 B) keyed/unkeyed BLAKE3 ROOT hash from u32[16] input directly.
+inline void hash_block_u32(const u32 block[16], const u32* key, u32 out[8]) {
+    u32 cv[8]; init_cv(cv, key);
+    u32 f = (key ? KEYED_HASH : (u32)0) | CHUNK_START | CHUNK_END | ROOT;
+    compress(cv, block, 0ULL, 64, f);
+    for (int i = 0; i < 8; ++i) out[i] = cv[i];
+}
+
+// Single-block (64 B) keyed/unkeyed BLAKE3 ROOT hash from u32[16] input to bytes out.
+inline void hash_block(const u32 block[16], const u32* key, uint8_t out[32]) {
+    u32 cv[8]; init_cv(cv, key);
+    u32 f = (key ? KEYED_HASH : (u32)0) | CHUNK_START | CHUNK_END | ROOT;
+    compress(cv, block, 0ULL, 64, f);
+    cv_to_bytes(cv, out);
+}
+
 // Single-chunk (≤1024 B) keyed/unkeyed BLAKE3 ROOT hash.
 inline void hash_small(const uint8_t* data, int len, const u32* key, uint8_t out[32]) {
     u32 cv[8]; init_cv(cv, key);
+    if (len == 64 && (reinterpret_cast<uintptr_t>(data) & 3) == 0) {
+        u32 bl[16];
+        for (int j = 0; j < 16; ++j) bl[j] = load_le32(data + j * 4);
+        u32 f = (key ? KEYED_HASH : (u32)0) | CHUNK_START | CHUNK_END | ROOT;
+        compress(cv, bl, 0ULL, 64, f);
+        cv_to_bytes(cv, out);
+        return;
+    }
     int nb = (len + 63) / 64; if (!nb) nb = 1;
     for (int b = 0; b < nb; ++b) {
         u32 bl[16]; alignas(4) uint8_t bf[64];   // alignas for aligned load_le32 (Gemini fix #1)
@@ -90,6 +114,14 @@ inline void hash_small(const uint8_t* data, int len, const u32* key, uint8_t out
 // Single-chunk (≤1024 B) keyed/unkeyed BLAKE3 ROOT hash returning u32[8] directly.
 inline void hash_small_u32(const uint8_t* data, int len, const u32* key, u32 out[8]) {
     u32 cv[8]; init_cv(cv, key);
+    if (len == 64 && (reinterpret_cast<uintptr_t>(data) & 3) == 0) {
+        u32 bl[16];
+        for (int j = 0; j < 16; ++j) bl[j] = load_le32(data + j * 4);
+        u32 f = (key ? KEYED_HASH : (u32)0) | CHUNK_START | CHUNK_END | ROOT;
+        compress(cv, bl, 0ULL, 64, f);
+        for (int i = 0; i < 8; ++i) out[i] = cv[i];
+        return;
+    }
     int nb = (len + 63) / 64; if (!nb) nb = 1;
     for (int b = 0; b < nb; ++b) {
         u32 bl[16]; alignas(4) uint8_t bf[64];

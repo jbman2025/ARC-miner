@@ -4,7 +4,7 @@
 // On-disk format is JSON (System.Text.Json, AOT-safe via source-gen). The
 // file is written atomically via temp + rename, owner-only perms (0600 on
 // POSIX). Default path: $HOME/.akoya/session.json (configurable via
-// AKOYA_SESSION_FILE).
+// ARC_SESSION_FILE).
 //
 // Lifecycle:
 //   - Read once at startup; if present, MiningSession tries Resume first.
@@ -36,7 +36,7 @@ public sealed record SessionRecord(
     string IdentityKey,
 
     /// <summary>The pool host:port this session was issued by. If the operator
-    /// repoints AKOYA_POOL_HOST to a different pool, we discard the file
+    /// repoints ARC_POOL_HOST to a different pool, we discard the file
     /// (different pool = different miner_id namespace).</summary>
     string PoolEndpoint,
 

@@ -1,5 +1,5 @@
-using System.Globalization;
 using System.Security.Cryptography;
+using Akoya.Crypto;
 using System.Text.Json;
 using PearlPool.Proto.V2;
 
@@ -8,7 +8,7 @@ namespace Akoya.Pool;
 public static class StratumJobParser
 {
     public static JobAssignment ParseNotification(
-        JsonElement.ArrayEnumerator paramsArray,
+        JsonElement arr,
         byte[] extranonce1,
         byte[] extranonce2)
     {
@@ -25,49 +25,32 @@ public static class StratumJobParser
         // 9: b_seed (optional/extended, 32 B hex)
         // 10: audit_k (optional/extended, uint)
 
-        var jobIdStr = paramsArray.Current.GetString() ?? "";
-        paramsArray.MoveNext();
+        var jobIdStr = arr[0].GetString() ?? "";
+        var prevHashBytes = HexToBytes(arr[1].GetString() ?? "");
+        var coinb1Bytes = HexToBytes(arr[2].GetString() ?? "");
+        var coinb2Bytes = HexToBytes(arr[3].GetString() ?? "");
+        var merkleBranch = arr[4];
+        var versionBytes = HexToBytes(arr[5].GetString() ?? "");
+        var nbitsBytes = HexToBytes(arr[6].GetString() ?? "");
+        var ntimeBytes = HexToBytes(arr[7].GetString() ?? "");
 
-        var prevHashBytes = HexToBytes(paramsArray.Current.GetString() ?? "");
-        paramsArray.MoveNext();
-
-        var coinb1Bytes = HexToBytes(paramsArray.Current.GetString() ?? "");
-        paramsArray.MoveNext();
-
-        var coinb2Bytes = HexToBytes(paramsArray.Current.GetString() ?? "");
-        paramsArray.MoveNext();
-
-        var merkleBranch = paramsArray.Current;
-        paramsArray.MoveNext();
-
-        var versionBytes = HexToBytes(paramsArray.Current.GetString() ?? "");
-        paramsArray.MoveNext();
-
-        var nbitsBytes = HexToBytes(paramsArray.Current.GetString() ?? "");
-        paramsArray.MoveNext();
-
-        var ntimeBytes = HexToBytes(paramsArray.Current.GetString() ?? "");
-        paramsArray.MoveNext();
-
-        // Skip clean_jobs (bool)
-        paramsArray.MoveNext();
-
-        // Default or extended parameters for Pearl network
         byte[] bSeed = new byte[32];
-        if (paramsArray.Current.ValueKind != JsonValueKind.Undefined)
+        if (arr.GetArrayLength() > 9)
         {
-            var bSeedHex = paramsArray.Current.GetString();
+            var bSeedHex = arr[9].GetString();
             if (!string.IsNullOrEmpty(bSeedHex))
             {
                 bSeed = HexToBytes(bSeedHex);
             }
         }
-        paramsArray.MoveNext();
 
         uint auditK = 8;
-        if (paramsArray.Current.ValueKind != JsonValueKind.Undefined)
+        if (arr.GetArrayLength() > 10)
         {
-            auditK = paramsArray.Current.GetUInt32();
+            if (arr[10].ValueKind == JsonValueKind.Number)
+            {
+                auditK = arr[10].GetUInt32();
+            }
         }
 
         // 1. Calculate Coinbase TX hash
@@ -78,7 +61,7 @@ public static class StratumJobParser
         Buffer.BlockCopy(extranonce2, 0, coinbaseTx, offset, extranonce2.Length); offset += extranonce2.Length;
         Buffer.BlockCopy(coinb2Bytes, 0, coinbaseTx, offset, coinb2Bytes.Length);
 
-        byte[] txHash = SHA256.HashData(SHA256.HashData(coinbaseTx));
+        byte[] txHash = Sha2.Sha256d(coinbaseTx);
 
         // 2. Calculate Merkle Root
         byte[] merkleRoot = txHash;
@@ -88,7 +71,7 @@ public static class StratumJobParser
             byte[] concat = new byte[merkleRoot.Length + node.Length];
             Buffer.BlockCopy(merkleRoot, 0, concat, 0, merkleRoot.Length);
             Buffer.BlockCopy(node, 0, concat, merkleRoot.Length, node.Length);
-            merkleRoot = SHA256.HashData(SHA256.HashData(concat));
+            merkleRoot = Sha2.Sha256d(concat);
         }
 
         // 3. Assemble the 76-byte block header (sigma)
@@ -129,24 +112,75 @@ public static class StratumJobParser
             Sigma = Google.Protobuf.ByteString.CopyFrom(sigma),
             TargetNbits = targetNbits,
             NetworkTargetNbits = targetNbits,
-            BlockHeight = 0,
+            // Recovered from the coinbase (BIP34) rather than left at 0. This used
+            // to be a hard-coded 0, which fed StratumNotifyParams.Height and made
+            // SaltedSeedFork.IsActive() answer FALSE forever on this path — so a
+            // pool that sends Bitcoin-style notifies pinned the miner to legacy V2
+            // seed derivation and, past the salted-seed height, had every share
+            // proved against the wrong noise field. Silently: SaltedSeedFork.Apply
+            // early-returns before its warning when the state does not change.
+            // 0 is still returned when the height cannot be read, which is exactly
+            // the old behaviour — this can only improve on it, never regress.
+            BlockHeight = TryParseBip34Height(coinb1Bytes),
             ProtocolVersion = 2,
             BSeed = Google.Protobuf.ByteString.CopyFrom(bSeed),
             AuditK = auditK
         };
     }
 
-    private static byte[] HexToBytes(string hex)
+    /// <summary>
+    /// Read the BIP34 block height out of a coinbase transaction's scriptSig.
+    ///
+    /// Since BIP34 the coinbase scriptSig MUST begin with a push of the block
+    /// height as a minimally-encoded little-endian CScriptNum, so the height is
+    /// available without asking the pool for it. It lives at the very start of the
+    /// scriptSig, which means it is inside <c>coinb1</c> (the part before the
+    /// extranonce splice) and is therefore always present here.
+    ///
+    /// Layout walked below:
+    /// <code>
+    ///   version(4) | in-count(1) | prev txid(32) | prev index(4) | scriptSig len(varint) | scriptSig...
+    ///   scriptSig: [push-len n][n height bytes, little-endian]
+    /// </code>
+    ///
+    /// Returns 0 for anything it cannot read confidently — a short buffer, a
+    /// non-standard opcode, or an implausible height. 0 means "unknown", which
+    /// every caller already treats as "not evidence of a fork state", so a weird
+    /// or hostile coinbase degrades to today's behaviour instead of asserting a
+    /// wrong height (which would be worse than none — it could flip a fork gate).
+    /// </summary>
+    internal static long TryParseBip34Height(ReadOnlySpan<byte> coinb1)
     {
-        if (string.IsNullOrEmpty(hex)) return [];
-        if (hex.Length % 2 != 0) hex = "0" + hex;
-        byte[] bytes = new byte[hex.Length / 2];
-        for (int i = 0; i < bytes.Length; i++)
-        {
-            bytes[i] = byte.Parse(hex.AsSpan(i * 2, 2), NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture);
-        }
-        return bytes;
+        // version(4) + input count(1) + prev txid(32) + prev index(4)
+        const int ScriptSigLenOffset = 4 + 1 + 32 + 4;
+        if (coinb1.Length < ScriptSigLenOffset + 2) return 0;
+
+        // scriptSig length varint. A coinbase scriptSig is capped at 100 bytes by
+        // consensus, so anything needing the multi-byte varint forms (>= 0xFD) is
+        // malformed — bail rather than guess at the encoding.
+        byte scriptSigLen = coinb1[ScriptSigLenOffset];
+        if (scriptSigLen is 0 or >= 0xFD) return 0;
+
+        int pushOffset = ScriptSigLenOffset + 1;
+        byte push = coinb1[pushOffset];
+
+        // Direct push of 1..4 bytes (OP_PUSHBYTES_1..4). Heights past ~16.7M need
+        // 4 bytes, and minimal CScriptNum encoding appends a 0x00 when the top bit
+        // of the final byte is set — 4 covers both. Anything else is not BIP34.
+        if (push is < 1 or > 4) return 0;
+        if (pushOffset + 1 + push > coinb1.Length) return 0;
+        if (push > scriptSigLen) return 0;
+
+        long height = 0;
+        for (int i = 0; i < push; i++)
+            height |= (long)coinb1[pushOffset + 1 + i] << (8 * i);
+
+        // Reject implausible values so a malformed coinbase cannot fake a height
+        // large enough to trip a fork gate. ~100M blocks is centuries away.
+        return height is > 0 and < 100_000_000 ? height : 0;
     }
+
+    private static byte[] HexToBytes(string hex) => Akoya.Crypto.Hex.Decode(hex);
 }
 
 internal static class BinaryPrimitives

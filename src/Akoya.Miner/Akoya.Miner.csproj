@@ -17,12 +17,13 @@
     <DefineConstants>$(DefineConstants);PERF_TIMINGS</DefineConstants>
   </PropertyGroup>
 
-  <!-- Set by build.ps1 (-p:AkoyaBackend=sycl) so backend-specific managed code
-       can be gated. SYCL_BACKEND drops the AxEBL_fp16 buffer the Arc kernel
-       never reads (see WorkerBuffers). Defaults off → CUDA/ROCm behaviour. -->
-  <PropertyGroup Condition="'$(AkoyaBackend)' == 'sycl'">
-    <DefineConstants>$(DefineConstants);SYCL_BACKEND</DefineConstants>
-  </PropertyGroup>
+  <!-- Almost everything in this assembly is internal (it is an exe, not a
+       library), so the unit tests need explicit access. -->
+  <ItemGroup>
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleToAttribute">
+      <_Parameter1>Akoya.Miner.Tests</_Parameter1>
+    </AssemblyAttribute>
+  </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\Akoya.Crypto\Akoya.Crypto.csproj" />
@@ -38,6 +39,14 @@
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="9.0.0" />
     <PackageReference Include="Microsoft.Extensions.Logging" Version="9.0.0" />
     <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="9.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Embed any native libraries staged in the EmbeddedLibs folder during build time -->
+    <EmbeddedResource Include="EmbeddedLibs\*">
+      <WithCulture>false</WithCulture>
+      <Type>Non-Resx</Type>
+    </EmbeddedResource>
   </ItemGroup>
 
   <!-- Embed git sha + miner version. Version comes from version.txt at the

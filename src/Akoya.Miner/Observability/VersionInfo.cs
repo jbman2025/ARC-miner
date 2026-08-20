@@ -11,7 +11,7 @@ internal static class VersionInfo
 {
     /// <summary>Bumped whenever the C# miner relies on a new capi entry point or
     /// changes the on-wire format. Compared against pearl_capi_*_version.</summary>
-    public const int RequiredGemmAbi   = 2;
+    public const int RequiredGemmAbi   = 4;
     public const int RequiredMiningAbi = 2;
 
     public static string MinerVersion =>
@@ -25,6 +25,14 @@ internal static class VersionInfo
             .GetCustomAttributes<AssemblyMetadataAttribute>()
             .FirstOrDefault(a => a.Key == "GitSha")?.Value
             ?? "unknown";
+
+    /// <summary>The agent string every pool handshake announces. Derive it here
+    /// and nowhere else: each algo's client used to carry its own literal, and
+    /// all five were still saying 0.3.0 when version.txt read 0.3.1 — a drift
+    /// nothing can catch, because a stale agent is still a valid handshake.
+    /// (`Akoya.Pool` builds the same string from its own identity record; it
+    /// cannot reference this assembly.)</summary>
+    public static string UserAgent => "ARC-miner/" + MinerVersion;
 
     public static int Run(string[] args)
     {

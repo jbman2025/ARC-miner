@@ -22,6 +22,10 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="Akoya.Pool.Tests" />
+    <!-- Akoya.Pool.Tests does not exist; the suite lives in Akoya.Miner.Tests,
+         which already covers StratumSession/StratumJobParser via their public
+         surface. Needed so the BIP34 height parser can be tested directly. -->
+    <InternalsVisibleTo Include="Akoya.Miner.Tests" />
   </ItemGroup>
 
   <ItemGroup>

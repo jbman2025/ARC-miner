@@ -17,6 +17,29 @@ public static partial class PearlGemmNative
     [LibraryImport(Lib, EntryPoint = "pearl_capi_build_profile")]
     public static partial nint BuildProfilePtr();
 
+    /// <summary>Select the noise-seed derivation for the salted-seed hardfork
+    /// (pearl PR #280): 0 = V2 legacy, 1 = V3 dimension-bound roots.
+    ///
+    /// An export rather than a params-struct field, so it is additive and the
+    /// pearl_capi ABI version does not move. A library built before the fork
+    /// lacks the symbol and throws EntryPointNotFoundException — which the
+    /// caller (SaltedSeedFork) catches and reports loudly, because the
+    /// alternative is a host and GPU that silently disagree.</summary>
+    [LibraryImport(Lib, EntryPoint = "pearl_capi_set_salted_seed")]
+    public static partial void SetSaltedSeed(int on);
+
+    [LibraryImport(Lib, EntryPoint = "pearl_capi_get_salted_seed")]
+    public static partial int GetSaltedSeed();
+
+    /// <summary>Runs the DEVICE noise-seed derivation — the same kernel the mining
+    /// path uses — so a test can prove the GPU and the C# host agree. Pass
+    /// stream = 0 to let it use its own queue. All buffers are 32 bytes.</summary>
+    [LibraryImport(Lib, EntryPoint = "pearl_capi_derive_noise_seeds")]
+    public static partial int DeriveNoiseSeedsDevice(
+        ref byte aMerkleRoot, ref byte bMerkleRoot, ref byte jobKey,
+        int m, int n, int salted,
+        ref byte outASeed, ref byte outBSeed, nint stream);
+
     public static string BuildProfile()
         => Marshal.PtrToStringUTF8(BuildProfilePtr()) ?? "unknown";
 
@@ -24,8 +47,10 @@ public static partial class PearlGemmNative
     public static partial nint TargetFamilyPtr();
 
     /// <summary>GPU family this kernel was AOT-compiled for: "acm" (Alchemist),
-    /// "bmg" (Battlemage), or "" (JIT — runs on any Arc). Older libs without the
-    /// export are treated as JIT (empty).</summary>
+    /// "bmg" (Battlemage), "fat" (one binary with both generations' AOT kernels,
+    /// runs on any Arc), or "" (JIT — runs on any Arc). The wrong-card guard only
+    /// fires for "acm"/"bmg". Older libs without the export are treated as JIT
+    /// (empty).</summary>
     public static string TargetFamily()
     {
         try { return Marshal.PtrToStringUTF8(TargetFamilyPtr()) ?? ""; }
@@ -57,98 +82,22 @@ public static partial class PearlGemmNative
         catch (EntryPointNotFoundException) { return m; }
     }
 
-    // tensor_hash: data, key, out, roots are all device pointers.
-    [LibraryImport(Lib, EntryPoint = "pearl_capi_tensor_hash")]
-    public static partial int TensorHash(
-        nint data, uint dataSize,
-        nint outHash,
+    // Trigger-path fused A regen + leaf-CV export: regenerates A for (seedLo,
+    // seedHi) in-register, writes only the first persistBytes (sm search rows) to
+    // aOut, and produces the full-A leaf-CV table + Merkle root — no full-A buffer.
+    // Lets the host keep the resident A buffer sized to the search window.
+    [LibraryImport(Lib, EntryPoint = "pearl_capi_tensor_hash_fused_leaf_cvs")]
+    public static partial int TensorHashFusedLeafCvs(
+        nint aOut,
+        ulong seedLo,
+        ulong seedHi,
+        long len,
+        long persistBytes,
         nint key,
-        uint numBlocks,
-        uint threadsPerBlock,
-        uint numStages,
-        uint leavesPerMtBlock,
         nint roots,
-        int deviceId,
-        nint stream);
-
-    [LibraryImport(Lib, EntryPoint = "pearl_capi_tensor_hash_leaf_cvs")]
-    public static partial int TensorHashLeafCvs(
-        nint data, uint dataSize,
         nint outHash,
-        nint key,
-        uint numBlocks,
-        uint threadsPerBlock,
-        uint numStages,
-        uint leavesPerMtBlock,
-        nint roots,
         nint leafCvs,
-        int deviceId,
         nint stream);
-
-    // Fused BSeed expansion + tensor_hash for B-state install. bSeed is a
-    // pinned host pointer; data/outHash/key/roots are device pointers.
-    [LibraryImport(Lib, EntryPoint = "pearl_capi_bseed_expand_and_tensor_hash")]
-    public static unsafe partial int BSeedExpandAndTensorHash(
-        byte* bSeed,
-        nint data,
-        uint dataSize,
-        nint outHash,
-        nint key,
-        uint numBlocks,
-        uint threadsPerBlock,
-        uint numStages,
-        uint leavesPerMtBlock,
-        nint roots,
-        int deviceId,
-        nint stream);
-
-    [LibraryImport(Lib, EntryPoint = "pearl_capi_bseed_expand_and_tensor_hash_leaf_cvs")]
-    public static unsafe partial int BSeedExpandAndTensorHashLeafCvs(
-        byte* bSeed,
-        nint data,
-        uint dataSize,
-        nint outHash,
-        nint key,
-        uint numBlocks,
-        uint threadsPerBlock,
-        uint numStages,
-        uint leavesPerMtBlock,
-        nint roots,
-        nint leafCvs,
-        int deviceId,
-        nint stream);
-
-    [LibraryImport(Lib, EntryPoint = "pearl_capi_commitment_hash_from_merkle_roots")]
-    public static partial int CommitmentHashFromMerkleRoots(
-        nint aMerkleRoot, nint bMerkleRoot,
-        nint key,
-        nint aCommitmentHash, nint bCommitmentHash,
-        int deviceId,
-        nint stream);
-
-    [LibraryImport(Lib, EntryPoint = "pearl_capi_noise_gen")]
-    public static partial int NoiseGen(
-        int r,
-        int m, int n, int k,
-        nint eal, nint ealFp16,
-        nint earRMajor, nint earKMajor,
-        nint ebrRMajor, nint ebrKMajor,
-        nint ebr, nint ebrFp16,
-        nint keyA, nint keyB,
-        nint stream);
-
-    [StructLayout(LayoutKind.Sequential)]
-    public struct NoiseBParams
-    {
-        public int N, K, R;
-        public nint B, EAR_K_major, EBL_R_major, EBR, EARxBpEB, BpEB;
-        // ABI v2: optional pre-allocated workspace handle (IntPtr.Zero =
-        // fall back to per-call cudaMallocAsync inside the .so).
-        public nint Workspace;
-    }
-
-    [LibraryImport(Lib, EntryPoint = "pearl_capi_noise_B")]
-    public static unsafe partial int NoiseB(NoiseBParams* p, nint stream);
 
     [StructLayout(LayoutKind.Sequential)]
     public struct InstallBParams
@@ -178,29 +127,16 @@ public static partial class PearlGemmNative
         public nint BpEB;
         public nint Workspace;
         public nint LeafCvs;
+
+        // ABI v4: seed derivation for THIS σ (0 = legacy, 1 = salted/V3).
+        // Mirrors `salted_seeds` as the LAST field of PearlCapiInstallBParams.
+        // The install path bakes the B-side noise from this, once per σ — a
+        // wrong value here is not corrected by anything downstream.
+        public int SaltedSeeds;
     }
 
     [LibraryImport(Lib, EntryPoint = "pearl_capi_install_B")]
     public static unsafe partial int InstallB(InstallBParams* p, nint stream);
-
-    [StructLayout(LayoutKind.Sequential)]
-    public struct NoisyGemmParams
-    {
-        public int M, N, K, R;
-        public int BM, BN, BK, CM, CN;
-
-        public nint A, B, EAL, EAL_fp16, EBR, EBR_fp16;
-        public nint EAR_R_major, EBL_R_major, EAR_K_major, EBL_K_major;
-        public nint AxEBL_fp16, EARxBpEB_fp16;
-        public nint ApEA, BpEB, A_scales, B_scales, C;
-        public nint HostSignalHeaderPinned, HostSignalSync;
-        public nint PowTarget, PowKey;
-        // ABI v2: optional pre-allocated workspace handle.
-        public nint Workspace;
-    }
-
-    [LibraryImport(Lib, EntryPoint = "pearl_capi_noisy_gemm")]
-    public static unsafe partial int NoisyGemm(NoisyGemmParams* p, nint stream);
 
     // ABI v2: per-σ workspace pool. Allocate once after noise_gen at
     // σ-refresh, pass the handle through every NoiseB / NoisyGemm call, free
@@ -220,19 +156,6 @@ public static partial class PearlGemmNative
     // proof-time A recovery does not need to keep snapshot buffers around.
     [LibraryImport(Lib, EntryPoint = "pearl_capi_lcg_int7_fill")]
     public static partial int LcgInt7Fill(nint dst, long n, ulong seedLo, ulong seedHi, nint stream);
-
-    // BSeed XOF expansion directly into a device buffer. bSeed is a pinned
-    // host pointer to the 32-byte seed; dst is a device pointer.
-    [LibraryImport(Lib, EntryPoint = "pearl_capi_bseed_expand_raw_device")]
-    public static unsafe partial int BSeedExpandRawDevice(byte* bSeed, nint dst, long n, nint stream);
-
-    [LibraryImport(Lib, EntryPoint = "pearl_capi_bseed_expand_range_raw_device")]
-    public static unsafe partial int BSeedExpandRangeRawDevice(
-        byte* bSeed,
-        ulong byteOffset,
-        nint dst,
-        long n,
-        nint stream);
 
     // ── Per-σ constant cache — eliminates per-iter argument marshalling ──────
     //
@@ -269,21 +192,22 @@ public static partial class PearlGemmNative
         public nint HostSignalSync;   // device — dSync coordination block
         public nint PowTarget;        // device uint32[8]
         public nint PowKey;           // device uint32[8]
-        public int SyclKSub;          // ABI v3: SYCL systolic depth (16 or 32)
+
+        // ABI v3: noise-seed derivation for THIS σ (0 = legacy raw roots,
+        // 1 = salted/V3). Must sit immediately after PowKey — it mirrors
+        // `salted_seeds` as the LAST field of PearlCapiWorkspaceParams, and
+        // SyclKSub below is a host-only trailing field the native side has
+        // never read. Inserting anything between PowKey and this breaks the
+        // struct layout silently.
+        public int SaltedSeeds;
+
+        public int SyclKSub;          // SYCL systolic depth (16 or 32); host-side only
     }
 
     // Install constant per-σ params into the workspace.  Must be called before
     // the first Iter() call.  Safe to call again on σ-rotation.
     [LibraryImport(Lib, EntryPoint = "pearl_capi_workspace_install_params")]
     public static unsafe partial int WorkspaceInstallParams(nint workspace, WorkspaceParams* p);
-
-    // Per-iteration hot path — replaces 5 separate CAPI calls per iter.
-    // Internally: lcg_int7_fill → tensor_hash → commitment_hash →
-    // noise_gen_A → noisy_gemm, reading all constants from the installed params.
-    // Only seedLo (nonce counter) and hostSignalHeaderPinned (pinned host slot)
-    // change between iterations.
-    [LibraryImport(Lib, EntryPoint = "pearl_capi_iter")]
-    public static partial int Iter(nint workspace, ulong seedLo, nint hostSignalHeaderPinned, nint stream);
 
     // Batched variant of Iter(): launches `count` consecutive nonces starting
     // at seedLoStart, using hostSignalHeaderPinnedBatch[i] as the pinned slot

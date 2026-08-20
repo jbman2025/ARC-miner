@@ -127,9 +127,12 @@ public sealed class CustomConsoleFormatter : ConsoleFormatter
             string separator = m.Groups[2].Value;
             string val = m.Groups[3].Value;
 
-            // Highlight values differently depending on content
+            // Highlight values differently depending on content. Treat a value as
+            // a measurement (→ green) only if it starts with a digit (covers
+            // 37.40, 500.0K, 58.8, 30s, 0x1A2…, 1.2e+3) or is a hashrate unit —
+            // so plain words like "status"/"Tls13" stay uncolored.
             string valColor = Reset;
-            if (val.EndsWith("H/s") || val.EndsWith('s') || double.TryParse(val, out _) || val.Contains("e+") || val.Contains("E+"))
+            if ((val.Length > 0 && char.IsDigit(val[0])) || val.EndsWith("H/s"))
             {
                 valColor = BrightGreen;
             }

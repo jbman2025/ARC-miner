@@ -132,7 +132,7 @@ public sealed record MiningConfiguration(
     }
 
     /// <summary>
-    /// Parse a comma-separated index list from an env var (e.g. AKOYA_ROWS_PATTERN
+    /// Parse a comma-separated index list from an env var (e.g. ARC_ROWS_PATTERN
     /// = "0,1,2,...,15"); returns <paramref name="fallback"/> if unset/blank.
     /// The committed hash-tile pattern MUST match what the GPU kernel actually
     /// XORs per tile, or shares are rejected. The ROCm (MI300X) kernel computes a
@@ -151,8 +151,8 @@ public sealed record MiningConfiguration(
     /// <summary>
     /// Default MiningConfiguration matching pearl-pure-miner: common_dim=k,
     /// rank=128, MMAType.Int7xInt7ToInt32. Rows/cols patterns default to the H100
-    /// hash-tile pattern but can be overridden via AKOYA_ROWS_PATTERN /
-    /// AKOYA_COLS_PATTERN (the ROCm path sets both to the contiguous 16x16 the
+    /// hash-tile pattern but can be overridden via ARC_ROWS_PATTERN /
+    /// ARC_COLS_PATTERN (the ROCm path sets both to the contiguous 16x16 the
     /// MI300X kernel computes). The pattern is committed in job_key and verified
     /// per-share, so any valid periodic AP is accepted by the network.
     /// </summary>
@@ -161,8 +161,8 @@ public sealed record MiningConfiguration(
             CommonDim: commonDim,
             Rank: rank,
             MmaType: MMAType.Int7xInt7ToInt32,
-            RowsPattern: PeriodicPattern.FromIndices(PatternFromEnv("AKOYA_ROWS_PATTERN", DefaultRowsIndices)),
-            ColsPattern: PeriodicPattern.FromIndices(PatternFromEnv("AKOYA_COLS_PATTERN", DefaultColsIndices)));
+            RowsPattern: PeriodicPattern.FromIndices(PatternFromEnv("ARC_ROWS_PATTERN", DefaultRowsIndices)),
+            ColsPattern: PeriodicPattern.FromIndices(PatternFromEnv("ARC_COLS_PATTERN", DefaultColsIndices)));
 
     /// <summary>
     /// Protocol dot-product length used by the per-tile target scaling.
@@ -302,25 +302,80 @@ public static class CommitmentHasher
         return (Blake3.KeyedHash(jobKey, aSlice), Blake3.KeyedHash(jobKey, bSlice));
     }
 
+    /// <summary>blake3("pearl/cert-v3/noise-seed/A") — the domain-separation key
+    /// for binding A's Merkle root. Hardcoded rather than hashed at startup, and
+    /// verified against this project's own BLAKE3 rather than copied on trust.</summary>
+    private static ReadOnlySpan<byte> SeedSaltA => new byte[]
+    {
+        0x82,0x49,0x40,0x6C, 0xA0,0xED,0x15,0x16, 0x96,0x16,0xF6,0x92, 0xFC,0xF0,0x76,0xF8,
+        0x92,0xDB,0xDB,0x2A, 0x70,0x23,0xB8,0x52, 0xF0,0xD4,0x77,0x19, 0xC3,0x90,0x01,0x7B,
+    };
+
+    /// <summary>blake3("pearl/cert-v3/noise-seed/B").</summary>
+    private static ReadOnlySpan<byte> SeedSaltB => new byte[]
+    {
+        0x11,0x30,0x06,0x32, 0xEC,0x63,0x01,0xCA, 0x2B,0xE2,0xAF,0x71, 0x8B,0x3F,0x4D,0x4F,
+        0x1A,0xE9,0xC6,0x39, 0x88,0xE8,0xCC,0x04, 0x48,0x44,0x30,0x1D, 0x71,0xB8,0x9A,0xA9,
+    };
+
+    /// <summary>V3 salting of one Merkle root (salted-seed hardfork, pearl
+    /// PR #280): keyed BLAKE3 over EXACTLY one 64-byte block holding
+    /// <c>root(32) ‖ dim as u32 LE(4) ‖ 28 zero bytes</c>.
+    ///
+    /// The zero padding is part of the message, not an artifact — BLAKE3 mixes
+    /// the input length into the final block, so hashing 36 bytes and hashing 36
+    /// bytes padded to 64 give different digests.</summary>
+    private static byte[] BindRoot(ReadOnlySpan<byte> merkleRoot, int dim, ReadOnlySpan<byte> salt)
+    {
+        Span<byte> block = stackalloc byte[64];
+        block.Clear();
+        merkleRoot.CopyTo(block);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(block[32..36], (uint)dim);
+        var bound = new byte[32];
+        Blake3.KeyedHash(salt, block, bound);
+        return bound;
+    }
+
     /// <summary>
     /// Derive chained noise seeds from jobKey and commitment hashes.
-    /// bNoiseSeed = BLAKE3(jobKey ‖ hashB)
-    /// aNoiseSeed = BLAKE3(bNoiseSeed ‖ hashA)
+    ///
+    /// V2 (pre-fork):
+    ///   bNoiseSeed = BLAKE3(jobKey ‖ hashB)
+    ///   aNoiseSeed = BLAKE3(bNoiseSeed ‖ hashA)
+    ///
+    /// V3 (<paramref name="salted"/>, from mainnet height 99,000): identical
+    /// chain, but over roots first bound to the dimension they were built from —
+    /// A to the row count <paramref name="m"/>, B to the column count
+    /// <paramref name="n"/>.
+    ///
+    /// This MUST stay bit-identical to launch_commitment_hash in
+    /// native/pearl-gemm/csrc/sycl/pearl_kernels.hpp. The GPU derives these seeds
+    /// to shape its search and the host re-derives them to build the share; if
+    /// the two ever disagree the miner proves the wrong noise field and every
+    /// share is rejected while the GPU stays busy.
     /// </summary>
     public static (byte[] BNoiseSeed, byte[] ANoiseSeed) DeriveNoiseSeeds(
         ReadOnlySpan<byte> jobKey,
         ReadOnlySpan<byte> hashA,
-        ReadOnlySpan<byte> hashB)
+        ReadOnlySpan<byte> hashB,
+        int m = 0,
+        int n = 0,
+        bool salted = false)
     {
+        // V3 binds each root to its dimension before the chain; V2 chains the
+        // raw roots. Everything after this point is identical in both versions.
+        ReadOnlySpan<byte> boundA = salted ? BindRoot(hashA, m, SeedSaltA) : hashA;
+        ReadOnlySpan<byte> boundB = salted ? BindRoot(hashB, n, SeedSaltB) : hashB;
+
         Span<byte> bInput = stackalloc byte[64];
         jobKey.CopyTo(bInput);
-        hashB.CopyTo(bInput[32..]);
+        boundB.CopyTo(bInput[32..]);
         var bNoiseSeed = new byte[32];
         Blake3.Hash(bInput, bNoiseSeed);
 
         Span<byte> aInput = stackalloc byte[64];
         bNoiseSeed.CopyTo(aInput);
-        hashA.CopyTo(aInput[32..]);
+        boundA.CopyTo(aInput[32..]);
         var aNoiseSeed = new byte[32];
         Blake3.Hash(aInput, aNoiseSeed);
 
